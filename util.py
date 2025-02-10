@@ -1,8 +1,8 @@
 from abc import ABC, abstractmethod
 import numpy as np 
 import os
-import gym
-import matplotlib.pyplot as plt
+# import gym
+# import matplotlib.pyplot as plt
 
 def relu(x):
   y = np.copy(x)
@@ -76,7 +76,7 @@ def from_one_hot(y):
   return np.argmax(y, axis=-1)
 
 def to_one_hot(a, size):
-  oh = np.zeros((a.shape[0], size), np.int)
+  oh = np.zeros((a.shape[0], size), int)
   oh[np.arange(a.shape[0]), a.astype(int)] = 1
   return oh
 
@@ -109,7 +109,7 @@ def linear_interpolat(start, end, end_t, cur_t):
       return [(e - s) * min(cur_t, end_t)  / end_t + s for (s, e) in zip(start, end)]
   else:
     if type(end_t) == list:
-      return [(end - start) * min(cur_t, d) / d + s for d in end_t]
+      return [(end - start) * min(cur_t, d) / d + start for d in end_t]
     else:          
       return (end - start) * min(cur_t, end_t) / end_t + start     
   

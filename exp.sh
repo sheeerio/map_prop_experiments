@@ -82,6 +82,5 @@ source ~/miniconda3/bin/activate myenv
 # python main_pre.py -c config_mp.ini --max_eps=1_400_000 --n_run=3 --name="3 layers" --exp_num=8
 # python main_pre.py -c config_mp.ini --hidden='[64,32,16]' --var='[0.3,0.6,0.8,0.1]' --lr='[0.04,0.00004,0.000004, 0.00006]' --max_eps=1_400_000 --n_run=3 --name="16 units" --exp_num=8
 # last layer 32 units
-# python test.py --exp_num=8
-python main_pre.py -c config_mp.ini --hidden='[64,32,16]' --var='[0.3,0.6,0.8,0.1]' --lr='[0.04,0.00004,0.000004, 0.00006]' --max_eps=1_400_000 --n_run=3 --name="16 units" --exp_num=8
+python test.py --exp_num=8
 conda deactivate
