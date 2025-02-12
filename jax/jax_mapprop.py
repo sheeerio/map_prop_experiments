@@ -1,5 +1,5 @@
+from functools import partial
 import jax.numpy as jnp
-from util import *
 import jax.random as jrandom
 from dataclasses import dataclass, replace
 from util_jax import *
@@ -13,16 +13,16 @@ L_DISCRETE = 4
 LS_REAL = [L_SOFTPLUS, L_RELU, L_LINEAR, L_SIGMOID]
 
 ACT_F = {
-    L_SOFTPLUS: softplus,
-    L_RELU: relu,
-    L_SIGMOID: sigmoid,
+    L_SOFTPLUS: jax_softplus,
+    L_RELU: jax_relu,
+    L_SIGMOID: jax_sigmoid,
     L_LINEAR: lambda x: x,
 }
 
 ACT_D_F = {
-    L_SOFTPLUS: sigmoid,
-    L_RELU: relu_d,
-    L_SIGMOID: sigmoid_d,
+    L_SOFTPLUS: jax_sigmoid,
+    L_RELU: jax_relu_grad,
+    L_SIGMOID: jax_sigmoid_grad,
     L_LINEAR: lambda x: 1,
 }
 
@@ -67,7 +67,7 @@ def init_eq_prop_layer(key, name, input_size, output_size, optimizer, var, temp,
                        values=values, new_values=new_values,
                        w_trace=w_trace, b_trace=b_trace), key
 
-@jit
+# @jit
 def compute_pot_mean(layer: EqPropLayer, inputs: jnp.ndarray):
     """
     Given inputs, compute the pre-activation (pot) and the mean.
@@ -80,7 +80,7 @@ def compute_pot_mean(layer: EqPropLayer, inputs: jnp.ndarray):
         mean = jax_softmax(pot / layer.temp, axis=-1)
     return pot, mean
 
-@jit
+# @jit
 def sample_layer(key, layer: EqPropLayer, inputs: jnp.ndarray):
     """
     Compute the potential and mean, then sample new values from the layer.
@@ -97,7 +97,7 @@ def sample_layer(key, layer: EqPropLayer, inputs: jnp.ndarray):
     new_layer = replace(layer, inputs=inputs, pot=pot, mean=mean, values=values)
     return new_layer, key
 
-@jit
+# @jit
 def refresh_layer(layer: EqPropLayer, freeze_value: bool):
     """
     Recompute the layer’s pot and mean using the stored inputs.
@@ -110,7 +110,7 @@ def refresh_layer(layer: EqPropLayer, freeze_value: bool):
     new_layer = replace(layer, pot=pot, mean=mean, values=values)
     return new_layer
 
-@jit
+# @jit
 def update_layer(key, layer: EqPropLayer, update_size: float, next_layer: Optional[EqPropLayer] = None):
     """
     Perform one update step (MAP gradient ascent) on the layer.
@@ -215,13 +215,13 @@ def init_network(key, state_n, action_n, hidden: List[int],
         l_type = output_l_type if d == len(hidden) else hidden_l_type
         layer, k = init_eq_prop_layer(k, name=f"layer_{d}",
                                       input_size=in_size, output_size=n,
-                                      optimizer=optimizer, var=var, temp=temp,
+                                      optimizer=optimizer, var=jax_getl(var,d), temp=temp,
                                       l_type=l_type)
         layers.append(layer)
         in_size = n
-    return Network(layers), k
+    return Network(layers=tuple(layers)), k
 
-@jit
+# @partial(jax.jit, static_argnames=("net",))
 def forward_network(key, net: Network, state: jnp.ndarray):
     """
     Forward pass through the network.
@@ -249,7 +249,7 @@ def map_grad_ascent(key, net: Network, steps: int, update_size: float):
         new_layers = []
         for idx, layer in enumerate(layers):
             next_layer = layers[idx+1] if idx+1 < len(layers) else None
-            layer, k = update_layer(k, layer, update_size, next_layer)
+            layer, k = update_layer(k, layer, update_size[idx], next_layer)
             layer = refresh_layer(layer, freeze_value=(idx==len(layers)-1))
             new_layers.append(layer)
         layers = new_layers

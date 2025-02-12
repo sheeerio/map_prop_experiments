@@ -7,6 +7,7 @@ import numpy as np
 import jax.random as jrandom
 from dataclasses import dataclass
 import gymnax
+import matplotlib.pyplot as plt
 from jax import tree_util
 import os
 
@@ -44,7 +45,7 @@ def jax_softplus(x):
         x > 30, x, jnp.log1p(jnp.exp(x))
     )
 
-@jit
+# @jit
 def jax_softmax(X, theta=1.0, axis=None):
     y = jnp.atleast_2d(X)
     if axis is None:
@@ -91,16 +92,16 @@ def jax_multinomial_rvs(key, n, p):
     out = out.at[..., -1].set(count)
     return out
 
-@jit
+# @jit
 def jax_from_one_hot(y):
-    return jnp.argmax(y, axis=-1)
+    return jnp.argmax(jnp.array(y), axis=-1)
 
 # @jit
 def jax_to_one_hot(a, size):
     oh = jnp.zeros((a.shape[0], size), dtype=int)
     return oh.at[jnp.arange(a.shape[0]), a.astype(int)].set(1)
 
-@jit
+# @jit
 def jax_getl(x, n):
     return x[n] if type(x) == list else x
 
@@ -158,7 +159,7 @@ def compute_delta(g, m, v, beta_1, beta_2, t, learning_rate, epsilon):
     new_v = beta_2 * v + (1 - beta_2) * jnp.power(g, 2)
     m_hat = new_m / (1 - jnp.power(beta_1, t))
     v_hat = new_v / (1 - jnp.power(beta_2, t))
-    delta = learning_rate * m_hat / (jnp.sqrt(v_hat) + epsilon)
+    delta = jnp.array([lr * m_hat / (jnp.sqrt(v_hat) + epsilon) for lr in learning_rate])
     return delta, new_m, new_v
 
 class jax_adam_optimizer():
@@ -405,3 +406,66 @@ def env_wrapper_step(key, state: EnvWrapperState, actions, env, env_params, rest
 
     info = {'state_code': state_code, 'truncated_end': truncated_end}
     return new_state, (next_obs, rewards, dones, info)
+
+def plot(curves, names, mv_n=100, end_n=1000, xlabel="Episodes", ylabel="Running Average Return", ylim=None, loc=4, save=True, save_dir="./result/plots/", filename="plot.png"):  
+    """
+    Plots the running average return for each curve and saves the plot as an image.
+
+    Parameters:
+    - curves (dict): Dictionary containing the curves to plot.
+    - names (dict): Dictionary mapping curve keys to their display names.
+    - mv_n (int): Window size for moving average.
+    - end_n (int): Number of episodes to consider for the plot.
+    - xlabel (str): Label for the x-axis.
+    - ylabel (str): Label for the y-axis.
+    - ylim (tuple, optional): Y-axis limits.
+    - loc (int): Location code for the legend.
+    - save (bool): Whether to save the plot. If False, the plot will not be saved.
+    - save_dir (str): Directory where the plot image will be saved.
+    - filename (str): Name of the plot image file.
+    """
+    plt.figure(figsize=(10, 7), dpi=150) 
+    colors = ['red', 'blue', 'green', 'crimson','orange', 'purple', 'cyan', 'magenta', 'yellow', 'black']
+    
+    for i, m in enumerate(names.keys()):    
+        # Apply moving average
+        v = np.array([mv(ep[:end_n], mv_n) for ep in curves[m][0]])
+        v = np.mean(v, axis=0)
+        r_std = np.std(v, axis=0) / np.sqrt(len(curves[m][0]))
+        v = np.concatenate([np.full([mv_n-1,], np.nan), v])
+        
+        k = names[m]
+        ax = plt.gca()         
+        ax.plot(np.arange(len(v)), v, label=k, color=colors[i % len(colors)])
+        ax.fill_between(np.arange(len(v)), v - r_std, v + r_std, label=None, alpha=0.2, color=colors[i % len(colors)])
+    
+    plt.xlabel(xlabel, fontsize=14)
+    plt.ylabel(ylabel, fontsize=14)      
+    if ylim is not None: 
+        plt.ylim(ylim)
+    plt.legend(loc=loc, fontsize=12)
+    # plt.title(save_dir[-4:])
+    plt.title("third layer var")
+    plt.tight_layout()
+    
+    if save:
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, filename)
+        plt.savefig(save_path)
+        print(f"Plot saved to {save_path}")
+    else:
+        plt.show()
+    
+    plt.close()
+
+# Print the statistic of episode return
+
+def print_stat(curves, names):
+  for m in names.keys():
+    print("Stat. on %s:" %m)
+    r = np.average(np.array(curves[m][0]), axis=1)
+    print("Return: avg. %.2f median %.2f min %.2f max %.2f std %.2f" % (np.average(r),
+                                                                        np.median(r),
+                                                                        np.amin(r),
+                                                                        np.amax(r),
+                                                                        np.std(r)))#/np.sqrt(len(r)))) 

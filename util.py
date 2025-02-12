@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 import numpy as np 
 import os
 # import gym
-# import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
 
 def relu(x):
   y = np.copy(x)
