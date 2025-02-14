@@ -112,7 +112,7 @@ def jax_neg_to_zero(x):
 
 @jit
 def jax_zero_to_neg(x):
-    return jnp.where(x > 1e-8, x, -x)
+    return jnp.where(x > 1e-8, 1.0, -1.0)
 
 
 @jit
@@ -191,29 +191,26 @@ class MDP(ABC):
   def act(self, actions):
     pass
 
-@partial(jit, static_argnames=("addr_size", "action_size", "x_size", "zero", "batch_size"))
 def reset_env(key, batch_size, addr_size, action_size, x_size, zero):
     new_key, subkey = jrandom.split(key)
-    x = jrandom.bernoulli(subkey, p=0.5, shape=(batch_size, x_size)).astype(jnp.int32)
+    x = jrandom.binomial(subkey, n=1, p=0.5, shape=(batch_size, x_size))
     
     factors = 2 ** (addr_size - 1 - jnp.arange(addr_size))
     reshaped = x[:, : addr_size * action_size].reshape(batch_size, action_size, addr_size)
     addr = jnp.sum(reshaped * factors, axis=2)  # shape: (batch_size, action_size)
     
-    col_indices = addr_size * action_size + addr  # shape: (batch_size, action_size)
+    col_indices = (addr_size * action_size + addr).astype(jnp.int32) # shape: (batch_size, action_size)
     y = jnp.take_along_axis(x, col_indices, axis=1)
     
     new_x = jax_zero_to_neg(x) if not zero else x
-    new_y = jax_neg_to_zero(y) if not zero else y
+    new_y = jax_zero_to_neg(y) if not zero else y
     return new_key, new_x, new_y
 
 @partial(jit, static_argnames=("reward_zero",))
 def act_env(y, actions, reward_zero):
-    """
-    Pure jitted function to compute rewards.
-    """
     corr = (y == actions.astype(jnp.int32)).astype(jnp.float32)
     return corr if reward_zero else jax_zero_to_neg(corr)
+
 
 @partial(jit, static_argnames=("zero", "reward_zero"))
 def expected_reward_env(x, y, p, zero, reward_zero):
@@ -833,7 +830,7 @@ def main():
         sys.exit(1)
     
     update_size = [i * args.update_adj for i in var]
-    print_every = 128 * 5
+    print_every = 128 * 500
     # Use Optax’s Adam optimizer (instead of a custom optimizer)
     print(lr)
 
