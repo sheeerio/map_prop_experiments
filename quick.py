@@ -58,34 +58,38 @@ def sigmoid_d(x):
 def softplus(x):
     return jnp.where(x > 30, x, jnp.log1p(jnp.exp(x)))
 
-def softmax(X, theta=1.0, axis=None):
-    y = jnp.atleast_2d(X)
-    if axis is None:
-        for i, dim in enumerate(y.shape):
-            if dim > 1:
-                axis = i
-                break
-    y = y * theta
+@partial(jax.jit, static_argnums=(2,))
+def softmax(X, theta=1.0, axis=-1):
+    y = X * theta
     max_val = jnp.max(y, axis=axis, keepdims=True)
     y = y - max_val
-    y = jnp.where(y < -30, -30, y)
+    # Clip values to avoid numerical underflow
+    y = jnp.clip(y, a_min=-30, a_max=None)
     y = jnp.exp(y)
     ax_sum = jnp.sum(y, axis=axis, keepdims=True)
-    p = y / ax_sum
-    if len(X.shape) == 1:
-        p = p.flatten()
-    return p
+    return y / ax_sum
 
+from jax import lax
+@jax.jit
 def multinomial_rvs(key, n, p):
+    num_categories = p.shape[-1]
     count = jnp.full(p.shape[:-1], n)
-    out = jnp.zeros(p.shape, dtype=jnp.int32)
+    out = jnp.zeros_like(p, dtype=jnp.int32)
     ps = jnp.cumsum(p, axis=-1)
     condp = jnp.where(ps == 0, 0.0, p / ps)
-    for i in range(p.shape[-1] - 1, 0, -1):
+
+    def body(i, state):
+        key, count, out = state
+        idx = num_categories - i
         key, subkey = jax.random.split(key)
-        binsample = jax.random.binomial(subkey, n=count, p=condp[..., i]).astype(jnp.int32)
-        out = out.at[..., i].set(binsample)
-        count = count - binsample
+        sample = jax.random.binomial(subkey, n=count, p=condp[..., idx]).astype(jnp.int32)
+        out = out.at[..., idx].set(sample)
+        count = count - sample
+        return (key, count, out)
+
+    state = (key, count, out)
+    state = lax.fori_loop(1, num_categories, body, state)
+    key, count, out = state
     out = out.at[..., 0].set(count)
     return key, out
 
@@ -120,8 +124,9 @@ def zero_to_neg(x):
 def neg_to_zero(x):
     return (x > 1e-8).astype(jnp.float32)
 
+@jax.jit
 def apply_mask(x, mask):
-    return (x.T * mask).T
+    return jnp.where(mask, x, 0)
 
 @jax.jit
 def linear_interpolat(start, end, end_t, cur_t):
@@ -140,10 +145,6 @@ class simple_grad_optimizer():
     def __init__(self, learning_rate):
         self.learning_rate = learning_rate
 
-    def delta(self, name, grads, learning_rate=None):
-        lr = self.learning_rate if learning_rate is None else learning_rate
-        return [lr * g for g in grads]
-
 class adam_optimizer():
     def __init__(self, learning_rate, beta_1=0.9, beta_2=0.999, epsilon=1e-09):
         self.beta_1 = beta_1
@@ -151,27 +152,6 @@ class adam_optimizer():
         self.epsilon = epsilon
         self.learning_rate = learning_rate
         self._cache = {}
-
-    def delta(self, grads, name="w", learning_rate=None, gate=None):
-        if name not in self._cache:
-            self._cache[name] = [[jnp.zeros_like(g) for g in grads],
-                                 [jnp.zeros_like(g) for g in grads],
-                                 0]
-        self._cache[name][2] += 1
-        t = self._cache[name][2]
-        deltas = []
-        lr = self.learning_rate if learning_rate is None else learning_rate
-        for n, g in enumerate(grads):
-            m = self._cache[name][0][n]
-            v = self._cache[name][1][n]
-            m = self.beta_1 * m + (1 - self.beta_1) * g
-            v = self.beta_2 * v + (1 - self.beta_2) * jnp.power(g, 2)
-            self._cache[name][0][n] = m
-            self._cache[name][1][n] = v
-            m_hat = m / (1 - jnp.power(self.beta_1, t))
-            v_hat = v / (1 - jnp.power(self.beta_2, t))
-            deltas.append(lr * m_hat / (jnp.sqrt(v_hat) + self.epsilon))
-        return deltas
 
 class MDP(ABC):
     def __init__(self):
@@ -287,6 +267,48 @@ ACT_D_F = {L_SOFTPLUS: sigmoid,
            L_SIGMOID: sigmoid_d,
            L_LINEAR: lambda x: 1}
 
+@partial(jax.jit, static_argnums=(3,4))
+def eq_prop_compute_pot_mean(inputs, w, b, l_type, temp, inv_var):
+    pot = jnp.dot(inputs, w) + b
+    if l_type in LS_REAL:
+        mean = ACT_F[l_type](pot)
+    else:
+        mean = softmax(pot / temp, theta=1.0, axis=-1)
+    return pot, mean
+
+@partial(jax.jit, static_argnums=(4,5))
+def eq_prop_sample(key, inputs, w, b, l_type, temp, inv_var):
+    pot, mean = eq_prop_compute_pot_mean(inputs, w, b, l_type, temp, inv_var)
+    if l_type in LS_REAL:
+        sigma = jnp.sqrt(1.0 / inv_var)
+        key, subkey = jax.random.split(key)
+        values = mean + sigma * jax.random.normal(subkey, shape=pot.shape)
+    else:
+        key, values = multinomial_rvs(key, 1, mean)
+    return inputs, key, pot, mean, values
+
+@partial(jax.jit, static_argnums=(5,6))
+def eq_prop_record_trace(inputs, values, mean, pot, inv_var, temp, l_type, gate, lambda_, w_trace, b_trace):
+    if l_type in LS_REAL:
+        v_ch = (values - mean) * ACT_D_F[l_type](pot) * inv_var
+    else:
+        v_ch = (values - mean) / temp
+    if gate is not None:
+        v_ch = v_ch * gate[:, None]
+    new_w_trace = w_trace * lambda_ + inputs[:, :, None] * v_ch[:, None, :]
+    new_b_trace = b_trace * lambda_ + v_ch
+    return new_w_trace, new_b_trace
+
+@jax.jit
+def eq_prop_learn_trace(w_trace, b_trace, reward, w, b, opt_state_w, opt_state_b, lr):
+    w_update = w_trace * reward[:, None, None]
+    b_update = b_trace * reward[:, None]
+    w_update = jnp.mean(w_update, axis=0)
+    b_update = jnp.mean(b_update, axis=0)
+    new_w, new_opt_state_w = adam_update_jit(w, w_update, opt_state_w, lr)
+    new_b, new_opt_state_b = adam_update_jit(b, b_update, opt_state_b, lr)
+    return new_w, new_b, new_opt_state_w, new_opt_state_b
+
 class eq_prop_layer():
     def __init__(self, name, input_size, output_size, optimizer, var, temp, l_type):
         if l_type not in [L_SOFTPLUS, L_RELU, L_LINEAR, L_SIGMOID, L_DISCRETE]:
@@ -320,25 +342,12 @@ class eq_prop_layer():
 
     def compute_pot_mean(self, inputs):
         self.inputs = inputs
-        self.pot = jnp.dot(inputs, self._w) + self._b
-        if self.l_type in LS_REAL:
-            self.mean = ACT_F[self.l_type](self.pot)
-        else:
-            self.mean = softmax(self.pot / self.temp, axis=-1)
+        self.pot, self.mean = eq_prop_compute_pot_mean(self.inputs, self._w, self._b, self.l_type, self.temp, self._inv_var)
 
     def sample(self, inputs):
-        self.compute_pot_mean(inputs)
-        if self.l_type in LS_REAL:
-            sigma = jnp.sqrt(1 / self._inv_var)
-            self.rng, subkey = jax.random.split(self.rng)
-            self.values = self.mean + sigma * jax.random.normal(subkey, shape=self.pot.shape)
-            return self.values
-        elif self.l_type == L_DISCRETE:
-            self.rng, subkey = jax.random.split(self.rng)
-            self.rng, sampled = multinomial_rvs(subkey, 1, self.mean)
-            self.values = sampled
-            return self.values
-
+        self.inputs, self.rng, self.pot, self.mean, self.values = eq_prop_sample(self.rng, inputs, self._w, self._b, self.l_type, self.temp, self._inv_var)
+        return self.values
+  
     def refresh(self, freeze_value):
         if self.prev_layer is not None:
             self.inputs = self.prev_layer.new_values
@@ -374,23 +383,17 @@ class eq_prop_layer():
             self.new_values = self.values + update_step
 
     def record_trace(self, gate=None, lambda_=0):
-        if self.l_type in LS_REAL:
-            v_ch = (self.values - self.mean) * ACT_D_F[self.l_type](self.pot) * self._inv_var
-        else:
-            v_ch = (self.values - self.mean) / self.temp
-        if gate is not None:
-            v_ch = v_ch * gate[:, None]
-        self.w_trace = self.w_trace * lambda_ + self.inputs[:, :, None] * v_ch[:, None, :]
-        self.b_trace = self.b_trace * lambda_ + v_ch
+        self.w_trace, self.b_trace = eq_prop_record_trace(
+            self.inputs, self.values, self.mean, self.pot,
+            self._inv_var, self.temp, self.l_type,
+            gate, lambda_, self.w_trace, self.b_trace
+        )
 
     def learn_trace(self, reward, lr=0.01):
-        w_update = self.w_trace * reward[:, None, None]
-        b_update = self.b_trace * reward[:, None]
-        w_update = jnp.mean(w_update, axis=0)
-        b_update = jnp.mean(b_update, axis=0)
-
-        self._w, self.opt_state_w = adam_update_jit(self._w, w_update, self.opt_state_w, lr)
-        self._b, self.opt_state_b = adam_update_jit(self._b, b_update, self.opt_state_b, lr)
+        self._w, self._b, self.opt_state_w, self.opt_state_b = eq_prop_learn_trace(
+            self.w_trace, self.b_trace, reward,
+            self._w, self._b, self.opt_state_w, self.opt_state_b, lr
+        )
 
     def clear_trace(self, mask):
         mask = mask.astype(jnp.float32)
@@ -579,12 +582,6 @@ def main():
         print("Error: 'lr' must be a valid JSON list")
         sys.exit(1)
 
-    L_SOFTPLUS = 0
-    L_RELU = 1
-    L_LINEAR = 2
-    L_SIGMOID = 3
-    L_DISCRETE = 4
-
     if args.env_name == "Multiplexer":
         env = complex_multiplexer_MDP(
             addr_size=5,
@@ -595,11 +592,6 @@ def main():
         gate = False
         output_l_type = L_DISCRETE
         action_n = 2 ** env.action_size
-    elif args.env_name == "Regression":
-        env = reg_MDP()
-        gate = True
-        output_l_type = L_LINEAR
-        action_n = 1
     else:
         print(f"Error: Unsupported environment '{args.env_name}'.")
         sys.exit(1)

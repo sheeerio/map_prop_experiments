@@ -176,7 +176,7 @@ def main():
         sys.exit(1)
 
     update_size = [i * args.update_adj for i in var]
-    print_every = 128 * 500
+    print_every = 128 * 5
 
     eps_ret_hist_full = []
     for j in range(args.n_run):
@@ -202,7 +202,6 @@ def main():
             elif args.env_name == "Regression":
                 action = action[:, 0]
                 reward = env.act(action)
-
             eps_ret_hist.append(np.average(reward))
 
             net.map_grad_ascent(
@@ -222,7 +221,7 @@ def main():
                 running_avg = np.average(eps_ret_hist[-print_every // args.batch_size:])
                 print(f"Run {j} Step {i} Running Avg. Reward\t{running_avg:.6f}")
                 print_count += print_every
-
+        break
         eps_ret_hist_full.append(eps_ret_hist)
 
     eps_ret_hist_full = np.asarray(eps_ret_hist_full, dtype=np.float32)
@@ -241,21 +240,21 @@ def main():
     result_file = os.path.join(result_dir, f"{args.name}.npy")
     print(f"Results (saved to {result_file}):")
     np.save(result_file, curves)
-    print_stat(curves, names)
+    # print_stat(curves, names)
     
     # Define the filename for the plot based on the run name
     plot_filename = f"{args.name}_plot.png"
     
     # Call the updated plot function with the save parameters
-    plot(
-        curves, 
-        names, 
-        mv_n=10, 
-        end_n=args.max_eps, 
-        save=True, 
-        save_dir=plots_dir, 
-        filename=plot_filename
-    )
+    # plot(
+    #     curves, 
+    #     names, 
+    #     mv_n=10, 
+    #     end_n=args.max_eps, 
+    #     save=True, 
+    #     save_dir=plots_dir, 
+    #     filename=plot_filename
+    # )
 
 
 if __name__ == "__main__":

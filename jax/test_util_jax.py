@@ -31,6 +31,10 @@ def test_softmax():
     before_each()
     assert_almost_equal(jax_softmax(x), softmax(x))
 
+def test_equal_zero():
+    before_each()
+    assert_almost_equal(jax_equal_zero(x), equal_zero(x))
+
 def test_multinomial_rvs():
     key = jrandom.PRNGKey(2025)
     n = 10

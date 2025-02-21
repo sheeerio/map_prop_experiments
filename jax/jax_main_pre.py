@@ -148,7 +148,6 @@ def main():
             elif args.env_name == "Regression":
                 action = action[:, 0]
                 reward = env.act(action)
-
             eps_ret_hist.append(jnp.average(reward))
             map_grad_ascent(
                 key,
@@ -164,7 +163,7 @@ def main():
                 running_avg = jnp.average(jnp.array(eps_ret_hist[-print_every // args.batch_size:]))
                 print(f"Run {j} Step {i} Running Avg. Rward\t{running_avg:.6f}")
                 print_count += print_every
-    
+        break
         eps_ret_hist.append(eps_ret_hist)
 
     eps_ret_hist_full = jnp.asarray(eps_ret_hist_full, dtype=float)
@@ -182,21 +181,21 @@ def main():
     result_file = os.path.join(result_dir, f"{args.name}.npy")
     print(f"Results (saved to {result_file}):")
     np.save(result_file, curves)
-    print_stat(curves, names)
+    # print_stat(curves, names)
     
     # Define the filename for the plot based on the run name
     plot_filename = f"{args.name}_plot.png"
     
     # Call the updated plot function with the save parameters
-    plot(
-        curves, 
-        names, 
-        mv_n=10, 
-        end_n=args.max_eps, 
-        save=True, 
-        save_dir=plots_dir, 
-        filename=plot_filename
-    )
+    # plot(
+    #     curves, 
+    #     names, 
+    #     mv_n=10, 
+    #     end_n=args.max_eps, 
+    #     save=True, 
+    #     save_dir=plots_dir, 
+    #     filename=plot_filename
+    # )
         
 if __name__ == "__main__":
     main()

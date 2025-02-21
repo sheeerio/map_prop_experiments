@@ -60,18 +60,6 @@ def jax_softmax(X, theta=1.0, axis=None):
 
 @jit
 def jax_multinomial_rvs(key, n, p):
-    """
-    Sample from the multinomial distribution using JAX.
-
-    Parameters:
-    - key: JAX random key
-    - n: Scalar count (number of trials)
-    - p: Probability array (..., k) where k is the number of categories.
-         p should sum to 1 along the last axis.
-
-    Returns:
-    - Samples with the same shape as `p`
-    """
     key, subkey = jrandom.split(key)
     count = jnp.full(p.shape[:-1], n)
     out = jnp.zeros(p.shape, dtype=int)
@@ -92,7 +80,7 @@ def jax_multinomial_rvs(key, n, p):
     out = out.at[..., -1].set(count)
     return out
 
-# @jit
+@jit
 def jax_from_one_hot(y):
     return jnp.argmax(jnp.array(y), axis=-1)
 

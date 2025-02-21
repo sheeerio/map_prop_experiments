@@ -27,7 +27,7 @@ ACT_D_F = {
 }
 
 
-@dataclass(frozen=True)
+@dataclass
 class EqPropLayer:
     name: str
     input_size: int
@@ -69,10 +69,6 @@ def init_eq_prop_layer(key, name, input_size, output_size, optimizer, var, temp,
 
 # @jit
 def compute_pot_mean(layer: EqPropLayer, inputs: jnp.ndarray):
-    """
-    Given inputs, compute the pre-activation (pot) and the mean.
-    Also return an updated layer that “remembers” the inputs, pot, and mean.
-    """
     pot = jnp.dot(inputs, layer._w) + layer._b
     if layer.l_type in LS_REAL:
         mean = ACT_F[layer.l_type](pot)
@@ -82,10 +78,6 @@ def compute_pot_mean(layer: EqPropLayer, inputs: jnp.ndarray):
 
 # @jit
 def sample_layer(key, layer: EqPropLayer, inputs: jnp.ndarray):
-    """
-    Compute the potential and mean, then sample new values from the layer.
-    Return an updated layer and a new key.
-    """
     pot, mean = compute_pot_mean(layer, inputs)
     if layer.l_type in LS_REAL:
         sigma = jnp.sqrt(1.0 / layer._inv_var)
@@ -99,10 +91,6 @@ def sample_layer(key, layer: EqPropLayer, inputs: jnp.ndarray):
 
 # @jit
 def refresh_layer(layer: EqPropLayer, freeze_value: bool):
-    """
-    Recompute the layer’s pot and mean using the stored inputs.
-    If freeze_value is False, update the current values from new_values.
-    """
     if layer.inputs is None:
         raise ValueError("Layer inputs are not set. Run a forward pass first.")
     pot, mean = compute_pot_mean(layer, layer.inputs)
@@ -112,11 +100,6 @@ def refresh_layer(layer: EqPropLayer, freeze_value: bool):
 
 # @jit
 def update_layer(key, layer: EqPropLayer, update_size: float, next_layer: Optional[EqPropLayer] = None):
-    """
-    Perform one update step (MAP gradient ascent) on the layer.
-    If next_layer is provided, use feedback from it.
-    Return the updated layer and a new key.
-    """
     if next_layer is None:
         if layer.l_type in LS_REAL:
             sigma = jnp.sqrt(1.0 / layer._inv_var)
@@ -215,7 +198,7 @@ def init_network(key, state_n, action_n, hidden: List[int],
         l_type = output_l_type if d == len(hidden) else hidden_l_type
         layer, k = init_eq_prop_layer(k, name=f"layer_{d}",
                                       input_size=in_size, output_size=n,
-                                      optimizer=optimizer, var=jax_getl(var,d), temp=temp,
+                                      optimizer=optimizer, var=var[d], temp=temp,
                                       l_type=l_type)
         layers.append(layer)
         in_size = n
@@ -223,11 +206,6 @@ def init_network(key, state_n, action_n, hidden: List[int],
 
 # @partial(jax.jit, static_argnames=("net",))
 def forward_network(key, net: Network, state: jnp.ndarray):
-    """
-    Forward pass through the network.
-    Each layer is sampled (using its sample_layer function).
-    The key is threaded through the layers.
-    """
     x = state
     new_layers = []
     k = key
@@ -238,11 +216,6 @@ def forward_network(key, net: Network, state: jnp.ndarray):
     return Network(new_layers), x, k
 
 def map_grad_ascent(key, net: Network, steps: int, update_size: float):
-    """
-    Perform several update steps on all layers (except possibly the output).
-    For simplicity, we update layers in order and use the following layer (if any)
-    for feedback.
-    """
     k = key
     layers = net.layers
     for i in range(steps):
@@ -256,9 +229,6 @@ def map_grad_ascent(key, net: Network, steps: int, update_size: float):
     return Network(layers), k
 
 def learn_network(net: Network, reward: jnp.ndarray, lr: float = 0.01):
-    """
-    Apply the learn_trace function to each layer.
-    """
     new_layers = []
     for layer in net.layers:
         new_layer = learn_trace_layer(layer, reward, lr)
