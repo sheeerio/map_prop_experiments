@@ -77,16 +77,34 @@ def softmax(X, theta=1.0, axis=None):
         p = p.flatten()
     return p
 
+# def multinomial_rvs(key, n, p):
+#     count = jnp.full(p.shape[:-1], n)
+#     out = jnp.zeros(p.shape, dtype=jnp.int32)
+#     ps = jnp.cumsum(p, axis=-1)
+#     condp = jnp.where(ps == 0, 0.0, p / ps)
+#     for i in range(p.shape[-1] - 1, 0, -1):
+#         key, subkey = jax.random.split(key)
+#         binsample = jax.random.binomial(subkey, n=count, p=condp[..., i]).astype(jnp.int32)
+#         out = out.at[..., i].set(binsample)
+#         count = count - binsample
+#     out = out.at[..., 0].set(count)
+#     return key, out
+
+@jax.jit
 def multinomial_rvs(key, n, p):
     count = jnp.full(p.shape[:-1], n)
     out = jnp.zeros(p.shape, dtype=jnp.int32)
     ps = jnp.cumsum(p, axis=-1)
     condp = jnp.where(ps == 0, 0.0, p / ps)
-    for i in range(p.shape[-1] - 1, 0, -1):
+    def body_fn(carry, i):
+        key, count, out = carry
         key, subkey = jax.random.split(key)
         binsample = jax.random.binomial(subkey, n=count, p=condp[..., i]).astype(jnp.int32)
         out = out.at[..., i].set(binsample)
         count = count - binsample
+        return (key, count, out), None
+    indices = jnp.arange(p.shape[-1] - 1, 0, -1)
+    (key, count, out), _ = jax.lax.scan(body_fn, (key, count, out), indices)
     out = out.at[..., 0].set(count)
     return key, out
 
@@ -507,7 +525,7 @@ def main():
     critic_lambda_ *= gamma
     actor_lambda_ *= gamma
 
-    print_every = 10000
+    print_every = 100
     eps_ret_hist_full = []
     print("Starting experiments on environment %s" % env_name)
 
@@ -564,9 +582,9 @@ def main():
             actor_net.map_grad_ascent(steps=map_grad_ascent_steps, state=None, gate=None, lambda_=actor_lambda_, 
                                     update_size=actor_update_size)              
 
-            value_old = jnp.copy(value_new)
-            mean_value_old = jnp.copy(mean_value_new)
-            prev_isEnd = jnp.copy(isEnd)    
+            value_old = value_new
+            mean_value_old = mean_value_new
+            prev_isEnd = isEnd   
             state, reward, isEnd, info = env.step(from_one_hot(action) if dis_act else action)
             
             c_eps_ret += reward
@@ -695,8 +713,6 @@ class BatchEnvs:
     @property
     def isEnd(self):
         return self.done
-
-
 
 
 if __name__ == "__main__":
