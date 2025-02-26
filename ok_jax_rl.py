@@ -14,6 +14,9 @@ import jax
 import jax.numpy as jnp
 from jax import tree_util
 from jax import jit
+import gym
+from gymnax.experimental import RolloutWrapper
+
 
 key = jax.random.PRNGKey(0)
 
@@ -45,9 +48,7 @@ def relu_d(x):
 @jax.jit
 def sigmoid(x):
     lim = 20.0
-    return jnp.where(x <= -lim, 0.0,
-                     jnp.where(x >= lim, 1.0,
-                               1.0 / (1.0 + jnp.exp(-x))))
+    return jax.nn.sigmoid(x)
 
 @jax.jit
 def sigmoid_d(x):
@@ -451,133 +452,45 @@ class Network():
             a.clear_values(mask)
 
 def main():
-    initial_parser = argparse.ArgumentParser(add_help=False)
-    initial_parser.add_argument(
-        "-c", "--config",
-        default="config_mp.ini",
-        help="Location of config file (default: config_mp.ini)"
-    )
-    args, remaining_argv = initial_parser.parse_known_args()
-
-    config_dir = "config"
-    f_name = os.path.join(config_dir, args.config)
-    print(f"Loading config from {f_name}")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-c", "--config", required=False, default="config_cp.ini",
+    help="location of config file")
+    args = ap.parse_args()
+    f_name = os.path.join("config", "%s" % args.config)
+    print("Loading config from %s" % f_name)
 
     config = configparser.ConfigParser(inline_comment_prefixes="#")
-    if not config.read(f_name):
-        print(f"Error: Config file '{f_name}' not found or is invalid.")
-        sys.exit(1)
+    config.read(f_name)
 
-    parser = argparse.ArgumentParser(
-        parents=[initial_parser],
-        description="Script with configurable parameters via config file and command-line flags."
-    )
+    name = config.get("USER", "name") # Name of the run
+    max_eps = config.getint("USER", "max_eps") # Number of episode per run
+    n_run = config.getint("USER", "n_run") # Number of runs
 
-    parser.add_argument(
-        "--name",
-        default=config.get("DEFAULT", "name"),
-        help="Name identifier for the run."
-    )
-    parser.add_argument(
-        "--exp_num",
-        type=int,
-        default=1,
-        help="Experiment number to help with tracking"
-    )
-    parser.add_argument(
-        "--max_eps",
-        type=int,
-        default=config.getint("DEFAULT", "max_eps"),
-        help="Number of episodes per run."
-    )
-    parser.add_argument(
-        "--n_run",
-        type=int,
-        default=config.getint("DEFAULT", "n_run"),
-        help="Number of runs."
-    )
+    batch_size = config.getint("USER", "batch_size") # Batch size
+    env_name = config.get("USER", "env_name") # Environment name
+    gamma = config.getfloat("USER", "gamma") # Discount rate
 
-    parser.add_argument(
-        "--env_name",
-        default=config.get("DEFAULT", "env_name"),
-        choices=["Multiplexer", "Regression"],
-        help="Environment name (e.g., Multiplexer, Regression)."
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=config.getint("DEFAULT", "batch_size"),
-        help="Batch size."
-    )
-    parser.add_argument(
-        "--hidden",
-        type=str,
-        default=config.get("DEFAULT", "hidden"),
-        help="JSON list of hidden units per layer (e.g., '[64, 32]')."
-    )
-    parser.add_argument(
-        "--l_type",
-        type=int,
-        choices=[0, 1, 2, 3, 4],
-        default=config.getint("DEFAULT", "l_type"),
-        help="Activation function type: 0=Softplus, 1=ReLU, 2=Linear, 3=Sigmoid, 4=Discrete."
-    )
-    parser.add_argument(
-        "--temp",
-        type=float,
-        default=config.getfloat("DEFAULT", "temp"),
-        help="Temperature for the network if applicable."
-    )
-    parser.add_argument(
-        "--var",
-        type=str,
-        default=config.get("DEFAULT", "var"),
-        help="JSON list of variances in hidden layers (e.g., '[0.3, 1, 1]')."
-    )
-    parser.add_argument(
-        "--update_adj",
-        type=float,
-        default=config.getfloat("DEFAULT", "update_adj"),
-        help="Step size for energy minimization adjustment."
-    )
-    parser.add_argument(
-        "--map_grad_ascent_steps",
-        type=int,
-        default=config.getint("DEFAULT", "map_grad_ascent_steps"),
-        help="Number of gradient ascent steps for energy minimization."
-    )
-    parser.add_argument(
-        "--lr",
-        type=str,
-        default=config.get("DEFAULT", "lr"),
-        help="JSON list of learning rates (e.g., '[0.04, 0.00004, 0.000004]')."
-    )
+    hidden = json.loads(config.get("USER","hidden")) # Number of hidden units on each layer
+    critic_l_type = config.getint("USER", "critic_l_type")  # Activation function for hidden units in critic network; 0 for softplus and 1 for ReLu
+    actor_l_type = config.getint("USER", "actor_l_type")  # Activation function for hidden units in actor network; 0 for softplus and 1 for ReLu
+    temp = config.getfloat("USER", "temp") # Temperature for actor network if applicable
 
-    args = parser.parse_args()
+    critic_var = json.loads(config.get("USER","critic_var")) # Variance in the normal distribution of critic network's layer
+    critic_update_adj = config.getfloat("USER", "critic_update_adj") # Step size for minimizing the energy of critic network equals to the layer's variance multiplied by this constant
+    critic_lambda_ = config.getfloat("USER", "critic_lambda_") # Trace decay rate for critic network
 
-    try:
-        hidden = json.loads(args.hidden)
-        if not isinstance(hidden, list):
-            raise ValueError
-    except (json.JSONDecodeError, ValueError):
-        print("Error: 'hidden' not a valid JSON")
-        sys.exit(1)
+    actor_var = json.loads(config.get("USER","actor_var")) # Variance in the normal distribution of actor network's layer
+    actor_update_adj = config.getfloat("USER", "actor_update_adj") # Step size for minimizing the energy of actor network equals to the layer's variance multiplied by this constant
+    actor_lambda_ = config.getfloat("USER", "actor_lambda_") # Trace decay rate for actor network
 
-    try:
-        var = json.loads(args.var)
-        if not isinstance(var, list):
-            raise ValueError
-    except (json.JSONDecodeError, ValueError):
-        print("Error: 'var' must be a valid JSON")
-        sys.exit(1)
+    map_grad_ascent_steps = config.getint("USER", "map_grad_ascent_steps") # number of step for minimizing the energy
+    reward_lim = config.getfloat("USER", "reward_lim") # whether limit the size of reward
 
-    try:
-        lr = json.loads(args.lr)
-        if not isinstance(lr, list):
-            raise ValueError
-    except (json.JSONDecodeError, ValueError):
-        print("Error: 'lr' must be a valid JSON list")
-        sys.exit(1)
+    critic_lr_st = json.loads(config.get("USER","critic_lr_st")) # Learning rate for each critic network's layer at the beginning
+    critic_lr_end = json.loads(config.get("USER","critic_lr_end")) # Learning rate for each critic network's layer at the beginning
+    actor_lr_st = json.loads(config.get("USER","actor_lr_st")) # Learning rate for each actor network's layer at the end
+    actor_lr_end = json.loads(config.get("USER","actor_lr_end")) # Learning rate for each actor network's layer at the end
+    end_t = config.getint("USER", "end_t") # Number of step to reach the final learning rate (linear interpolation for in-between steps)
 
     L_SOFTPLUS = 0
     L_RELU = 1
@@ -585,85 +498,206 @@ def main():
     L_SIGMOID = 3
     L_DISCRETE = 4
 
-    if args.env_name == "Multiplexer":
-        env = complex_multiplexer_MDP(
-            addr_size=5,
-            action_size=1,
-            zero=False,
-            reward_zero=False
-        )
-        gate = False
-        output_l_type = L_DISCRETE
-        action_n = 2 ** env.action_size
-    else:
-        print(f"Error: Unsupported environment '{args.env_name}'.")
-        sys.exit(1)
 
-    update_size = [i * args.update_adj for i in var]
-    print_every = 128 * 500
+    env = BatchEnvs(name=env_name, batch_size=batch_size, rest_n=0, warm_n=0)   
+    dis_act = type(env.action_space) != gymnax.environments.spaces.Box
+    
+    critic_update_size = [i * critic_update_adj for i in critic_var]
+    actor_update_size = [i * actor_update_adj for i in actor_var]
+    critic_lambda_ *= gamma
+    actor_lambda_ *= gamma
 
+    print_every = 10000
     eps_ret_hist_full = []
-    for j in range(args.n_run):
-        net = Network(
-            state_n=env.x_size,
-            action_n=action_n,
-            hidden=hidden,
-            var=var,
-            temp=args.temp,
-            hidden_l_type=args.l_type,
-            output_l_type=output_l_type
-        )
+    print("Starting experiments on environment %s" % env_name)
 
-        eps_ret_hist = []
-        print_count = print_every
-        for i in range(args.max_eps // args.batch_size):
-            state = env.reset(args.batch_size)
-            action = net.forward(state)
-            if args.env_name == "Multiplexer":
-                action = zero_to_neg(from_one_hot(action))[:, jnp.newaxis]
-                reward = env.act(action)[:, 0]
-            elif args.env_name == "Regression":
-                action = action[:, 0]
-                reward = env.act(action)
-            eps_ret_hist.append(np.average(np.array(reward)))
+    for j in range(n_run):
+        # this critic network takes in the state dim, action dim, number of hidden units per layer, variance per layer, 
+        # hidden_l_type : activation function for hidden units in critic network; 0 for softplus and 1 for ReLu
+        # output_l_type : activation function for the output
+        critic_net = Network(state_n=env.state.shape[1], action_n=1, hidden=hidden, var=critic_var, 
+                            temp=None, hidden_l_type=critic_l_type, output_l_type=L_LINEAR,)   
+        output_l_type = L_DISCRETE if dis_act else L_LINEAR   
+        action_n = env.action_space.n if dis_act else env.action_space.shape[0]    
+        actor_net = Network(state_n=env.state.shape[1], action_n=action_n, hidden=hidden, var=actor_var, 
+                            temp=temp, hidden_l_type=actor_l_type, output_l_type=output_l_type)
+        
+        eps_ret_hist = []  
+        c_eps_ret = jnp.zeros(batch_size)
+            
+        print_count = print_every         
+        value_old = None
+        isEnd = env.isEnd
+        prev_isEnd = env.isEnd
+        truncated, solved, f_perfect = False, False, False
+        
+        state = env.reset()
+        for i in range(int(1e9)):     
+            action = actor_net.forward(state)
 
-            net.map_grad_ascent(
-                steps=args.map_grad_ascent_steps,
-                state=None,
-                gate=gate,
-                lambda_=0,
-                update_size=update_size
-            )
+            if not dis_act:
+                action = action * (env.action_space.high[0] - env.action_space.low[0]) - env.action_space.low[0]
+                action = jnp.clip(action, env.action_space.low, env.action_space.high)
+            
+            value_new = critic_net.forward(state)[:,0]
+            mean_value_new = critic_net.layers[-1].mean[:,0]   
+            
+            if value_old is not None:      
+                if reward_lim > 0: reward = jnp.clip(reward, -reward_lim, +reward_lim)
+                targ_value = reward + gamma * mean_value_new * (~isEnd).astype(float)      
+                critic_reward = targ_value - mean_value_old
+                critic_reward = critic_reward.at[prev_isEnd].set(0)
+                actor_reward = targ_value - mean_value_old
+                actor_reward = actor_reward.at[prev_isEnd].set(0)            
+                
+                cur_critic_lr = linear_interpolat(start=critic_lr_st, end=critic_lr_end, end_t=end_t, cur_t=i)
+                cur_actor_lr = linear_interpolat(start=actor_lr_st, end=actor_lr_end, end_t=end_t, cur_t=i)  
+                
+                critic_net.learn(critic_reward, lr=cur_critic_lr)      
+                actor_net.learn(actor_reward, lr=cur_actor_lr)          
+        
+            critic_net.clear_trace(~prev_isEnd)
+            critic_net.map_grad_ascent(steps=map_grad_ascent_steps, state=None, gate=True, lambda_=critic_lambda_, 
+                            update_size=critic_update_size)           
 
-            if args.env_name == "Regression":
-                reward = env.y - net.layers[-1].mean[:, 0]
+            actor_net.clear_trace(~prev_isEnd)  
+            actor_net.map_grad_ascent(steps=map_grad_ascent_steps, state=None, gate=None, lambda_=actor_lambda_, 
+                                    update_size=actor_update_size)              
 
-            net.learn(reward, lr=lr)
-
-            if (i * args.batch_size) > print_count:
-                running_avg = np.average(eps_ret_hist[-print_every // args.batch_size:])
-                print(f"Run {j} Step {i} Running Avg. Reward\t{running_avg:.6f}")
-                print_count += print_every
+            value_old = jnp.copy(value_new)
+            mean_value_old = jnp.copy(mean_value_new)
+            prev_isEnd = jnp.copy(isEnd)    
+            state, reward, isEnd, info = env.step(from_one_hot(action) if dis_act else action)
+            
+            c_eps_ret += reward
+            
+            if jnp.any(isEnd):
+                eps_ret_hist.extend(c_eps_ret[isEnd].tolist())
+                c_eps_ret = c_eps_ret.at[isEnd].set(0.)
+            
+            if len(eps_ret_hist) >= max_eps: break       
+            
+            if i*batch_size > print_count and len(eps_ret_hist) > 0:      
+                f_str = "Run %d: Step %d Eps %d\t Running Avg. Return %f\t Max Return %f \t" 
+                eps_ret_hist_jp = jnp.array(eps_ret_hist)
+                f_arg = [j+1, i, len(eps_ret_hist), jnp.average(eps_ret_hist_jp[-100:]), jnp.amax(eps_ret_hist_jp),]
+                print(f_str % tuple(f_arg))
+                print_count += print_every          
         eps_ret_hist_full.append(eps_ret_hist)
 
-    eps_ret_hist_full = np.asarray(eps_ret_hist_full, dtype=np.float32)
     print("Finished Training")
-
-    curves = {args.name: (eps_ret_hist_full,)}
-    names = {k: k for k in curves.keys()}
-
-    plots_dir = os.path.join(f"result/exp{args.exp_num}", "plots")
-    os.makedirs(plots_dir, exist_ok=True)
-
-    result_dir = f"result/exp{args.exp_num}"
-    os.makedirs(result_dir, exist_ok=True)
-    result_file = os.path.join(result_dir, f"{args.name}.npy")
-    print(f"Results (saved to {result_file}):")
-    np.save(result_file, curves)
+    curves = {}  
+    curves[name] = (eps_ret_hist_full,)
+    names = {k:k for k in curves.keys()}
+    f_name = os.path.join("result", "%s.npy" % name) 
+    print("Results (saved to %s):" % f_name)
+    np.save(f_name, curves)
     print_stat(curves, names)
+    plot(curves, names, mv_n=100, end_n=max_eps)
+  # to get the gym action_space
 
-    # plot_filename = f"{args.name}_plot.png"
-    # plot(curves, names, mv_n=10, end_n=args.max_eps, save=True, save_dir=plots_dir, filename=plot_filename)
+class BatchEnvs:
+    def __init__(self, name, batch_size=1, rest_n=100, warm_n=100):
+        self.batch_size = int(batch_size)
+        self.rest_n = rest_n
+        self.warm_n = warm_n
+
+        # Use Gymnax's RolloutWrapper to create the environment and its parameters.
+        self.rollout_wrapper = RolloutWrapper(env_name=name)
+        self.env = self.rollout_wrapper.env
+        self.env_params = self.rollout_wrapper.env_params
+
+        # For access to the Gym action space.
+        self._gym_action_space = gym.make(name).action_space
+
+        # Initialize a PRNG key.
+        self.key = jax.random.PRNGKey(0)
+
+        # Initialize the batched environment state via vmap over the reset function.
+        keys = jax.random.split(self.key, self.batch_size)
+        # env.reset returns (obs, full_state)
+        obs, full_state = jax.vmap(self.env.reset, in_axes=(0, None))(keys, self.env_params)
+        self._obs = obs
+        self._full_state = full_state
+
+        # Initialize our extra counters.
+        self._rest = jnp.zeros(self.batch_size)
+        self._warm = jnp.zeros(self.batch_size)
+        self._stateCode = jnp.zeros(self.batch_size, dtype=jnp.int32)
+
+        # Placeholders for rewards, done flags, and info.
+        self.reward = jnp.zeros(self.batch_size)
+        self.done = jnp.zeros(self.batch_size, dtype=bool)
+        self.info = {"stateCode": self._stateCode,
+                     "truncatedEnd": jnp.zeros(self.batch_size, dtype=bool)}
+
+    def reset(self):
+        """Reset all environments and counters; return the observation."""
+        self.key, subkey = jax.random.split(self.key)
+        keys = jax.random.split(subkey, self.batch_size)
+        obs, full_state = jax.vmap(self.env.reset, in_axes=(0, None))(keys, self.env_params)
+        self._obs = obs
+        self._full_state = full_state
+
+        self._rest = jnp.zeros(self.batch_size)
+        self._warm = jnp.zeros(self.batch_size)
+        self._stateCode = jnp.zeros(self.batch_size, dtype=jnp.int32)
+        self.reward = jnp.zeros(self.batch_size)
+        self.done = jnp.zeros(self.batch_size, dtype=bool)
+        self.info = {"stateCode": self._stateCode,
+                     "truncatedEnd": jnp.zeros(self.batch_size, dtype=bool)}
+        return self.observation
+
+    def step(self, actions):
+        # Generate a separate rng key for each environment in the batch.
+        self.key, subkey = jax.random.split(self.key)
+        step_keys = jax.random.split(subkey, self.batch_size)
+
+        # step_fn returns ((next_obs, next_state), reward, done, info).
+        step_fn = lambda key, st, action: self.env.step(key, st, action, self.env_params)
+
+        next_obs, next_state, reward, done, info = jax.vmap(step_fn, in_axes=(0, 0, 0))(
+            step_keys, self._full_state, actions
+        )
+
+        # Update custom counters, etc...
+        self._rest = self._rest + jnp.where(done, 1, 0)
+        self._warm = self._warm + 1
+        ...
+        # Now store them properly:
+        self._full_state = next_state   # The internal state used by Gymnax
+        self._obs = next_obs           # The observation used by your agent
+
+        self.reward = reward
+        self.done = done
+        self.info = info  # or add your own fields if needed
+
+        return self._obs, self.reward, self.done, self.info
+
+    @property
+    def observation(self):
+        """Return the observation for training (not the full state)."""
+        return self._obs
+
+    @property
+    def full_state(self):
+        """Return the full environment state (for internal use)."""
+        return self._full_state
+      
+    @property
+    def state(self):
+        return self._obs
+
+    @property
+    def action_space(self):
+        return self._gym_action_space
+
+    @property
+    def isEnd(self):
+        return self.done
+
+
+
 
 if __name__ == "__main__":
     main()
