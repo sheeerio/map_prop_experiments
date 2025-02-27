@@ -262,14 +262,16 @@ class MNIST_MDP(MDP):
             pred = jnp.argmax(actions, axis=1)
         else:
             pred = actions.flatten()
+        # print(pred, self.current_y)
         # Raw reward: +1 for correct, -1 for incorrect.
-        raw_reward = jnp.where(pred == self.current_y, 1.0, -1.0)
-        # Compute baseline as the mean reward of the batch.
+        raw_reward = jnp.where(pred == self.current_y, 1.0, 0.0)
+        # # # Compute baseline as the mean reward of the batch.
         # baseline = jnp.mean(raw_reward)
         # advantage = raw_reward - baseline
-        # # Apply gamma (for multi-step returns, here gamma=1 is typical)
-        # discounted_reward = self.gamma * advantage
-        # return discounted_reward.reshape(-1, 1)
+        # # print(advantage)
+        # # # # Apply gamma (for multi-step returns, here gamma=1 is typical)
+        # # discounted_reward = self.gamma * advantage
+        # return advantage.reshape(-1, 1)
         return raw_reward.reshape(-1,1)
 
 @jax.jit
@@ -665,17 +667,16 @@ def main():
     print_every = 128 * 50
 
     eps_ret_hist_full = []
+    net = Network(
+              state_n=env.x_size,
+              action_n=action_n,
+              hidden=hidden,
+              var=var,
+              temp=args.temp,
+              hidden_l_type=args.l_type,
+              output_l_type=output_l_type
+          )
     for j in range(args.n_run):
-        # net = Network(
-        #     state_n=env.x_size,
-        #     action_n=action_n,
-        #     hidden=hidden,
-        #     var=var,
-        #     temp=args.temp,
-        #     hidden_l_type=args.l_type,
-        #     output_l_type=output_l_type
-        # )
-
         eps_ret_hist = []
         print_count = print_every
         for i in range(args.max_eps // args.batch_size):
