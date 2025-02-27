@@ -7,7 +7,7 @@ import sys
 import json
 import random
 import numpy as np
-import gymnax
+# import gymnax
 import matplotlib.pyplot as plt
 from functools import partial
 import jax
@@ -221,6 +221,57 @@ class complex_multiplexer_MDP(MDP):
         reward_f = reward_f.at[jnp.arange(self.x.shape[0]), y_zero.astype(jnp.int32)].set(1)
         return jnp.sum(reward_f * p, axis=-1)
 
+class MNIST_MDP(MDP):
+    def __init__(self, train=True, gamma=1.0):
+        # Load MNIST from keras
+        from keras.datasets import mnist
+        (X_train, y_train), (X_test, y_test) = mnist.load_data()
+        # Use training or testing data
+        X = X_train if train else X_test
+        y = y_train if train else y_test
+
+        # Flatten images (28x28 -> 784) and normalize to [0,1]
+        X = X.reshape(-1, 28 * 28).astype('float32') / 255.0
+
+        # Convert to JAX arrays
+        self.X = jnp.array(X)
+        self.y = jnp.array(y)
+        self.dataset_size = self.X.shape[0]
+        self.x_size = 28 * 28
+        self.n_classes = 10
+        self.gamma = gamma  # Discount factor (for one-step returns, gamma=1 is typical)
+        self.rng = jax.random.PRNGKey(random.randint(0, 2**31 - 1))
+
+    def reset(self, batch_size):
+        # Randomly sample batch indices from the dataset
+        self.rng, subkey = jax.random.split(self.rng)
+        indices = jax.random.randint(subkey, shape=(batch_size,), minval=0, maxval=self.dataset_size)
+        self.current_X = self.X[indices]
+        self.current_y = self.y[indices]
+        return self.current_X
+
+    def act(self, actions):
+        """
+        Compare the predicted actions with the stored labels.
+        If actions are one-hot, convert them to discrete labels.
+        Returns a reward of +1 if correct and -1 if incorrect.
+        The reward is then baseline-corrected by subtracting the batch mean.
+        """
+        # Convert one-hot predictions to labels if needed.
+        if actions.ndim > 1 and actions.shape[1] > 1:
+            pred = jnp.argmax(actions, axis=1)
+        else:
+            pred = actions.flatten()
+        # Raw reward: +1 for correct, -1 for incorrect.
+        raw_reward = jnp.where(pred == self.current_y, 1.0, -1.0)
+        # Compute baseline as the mean reward of the batch.
+        # baseline = jnp.mean(raw_reward)
+        # advantage = raw_reward - baseline
+        # # Apply gamma (for multi-step returns, here gamma=1 is typical)
+        # discounted_reward = self.gamma * advantage
+        # return discounted_reward.reshape(-1, 1)
+        return raw_reward.reshape(-1,1)
+
 @jax.jit
 def act_complex_multiplexer(y, actions, reward_zero):
     corr = (y == actions.astype(jnp.int32)).astype(jnp.float32)
@@ -334,6 +385,9 @@ class eq_prop_layer():
             self.values = self.mean + sigma * jax.random.normal(subkey, shape=self.pot.shape)
             return self.values
         elif self.l_type == L_DISCRETE:
+            if self.next_layer is None:
+                self.values = self.mean
+                return self.values
             self.rng, subkey = jax.random.split(self.rng)
             self.rng, sampled = multinomial_rvs(subkey, 1, self.mean)
             self.values = sampled
@@ -347,6 +401,7 @@ class eq_prop_layer():
             self.values = self.new_values
 
     def update(self, update_size):
+        # output layer
         if self.next_layer is None:
             if self.l_type in LS_REAL:
                 sigma = jnp.sqrt(1 / self._inv_var)
@@ -356,6 +411,7 @@ class eq_prop_layer():
                 self.rng, subkey = jax.random.split(self.rng)
                 self.rng, sampled = multinomial_rvs(subkey, 1, self.mean)
                 self.new_values = sampled
+        # layers except output layer
         elif self.l_type in LS_REAL:
             lower_pot = (self.mean - self.values) * self._inv_var
             if self.next_layer is None:
@@ -595,28 +651,35 @@ def main():
         gate = False
         output_l_type = L_DISCRETE
         action_n = 2 ** env.action_size
+    elif args.env_name == "MNIST":
+        env = MNIST_MDP(train=True)
+        gate = False
+        output_l_type = L_DISCRETE
+        action_n = env.n_classes
+
     else:
         print(f"Error: Unsupported environment '{args.env_name}'.")
         sys.exit(1)
 
     update_size = [i * args.update_adj for i in var]
-    print_every = 128 * 500
+    print_every = 128 * 50
 
     eps_ret_hist_full = []
     for j in range(args.n_run):
-        net = Network(
-            state_n=env.x_size,
-            action_n=action_n,
-            hidden=hidden,
-            var=var,
-            temp=args.temp,
-            hidden_l_type=args.l_type,
-            output_l_type=output_l_type
-        )
+        # net = Network(
+        #     state_n=env.x_size,
+        #     action_n=action_n,
+        #     hidden=hidden,
+        #     var=var,
+        #     temp=args.temp,
+        #     hidden_l_type=args.l_type,
+        #     output_l_type=output_l_type
+        # )
 
         eps_ret_hist = []
         print_count = print_every
         for i in range(args.max_eps // args.batch_size):
+            # print("Bang bang")
             state = env.reset(args.batch_size)
             action = net.forward(state)
             if args.env_name == "Multiplexer":
@@ -625,8 +688,14 @@ def main():
             elif args.env_name == "Regression":
                 action = action[:, 0]
                 reward = env.act(action)
+            elif args.env_name == "MNIST":
+                # If the network output is one-hot, convert to label indices.
+                action = jnp.argmax(action, axis=1)
+                reward = env.act(action)[:, 0]
+
             eps_ret_hist.append(np.average(np.array(reward)))
 
+            # 2. MAP-Prop Update phase
             net.map_grad_ascent(
                 steps=args.map_grad_ascent_steps,
                 state=None,
@@ -634,10 +703,11 @@ def main():
                 lambda_=0,
                 update_size=update_size
             )
-
+           
             if args.env_name == "Regression":
                 reward = env.y - net.layers[-1].mean[:, 0]
-
+            
+            # 3. REINFORCE phase
             net.learn(reward, lr=lr)
 
             if (i * args.batch_size) > print_count:

@@ -16,6 +16,7 @@ from jax import tree_util, jit
 import gym
 from gymnax.experimental import RolloutWrapper
 
+# --- Optimizer Functions ---
 def simple_grad_update(params, grads, lr):
     return tree_util.tree_map(lambda p, g: p + lr * g, params, grads)
 
@@ -33,6 +34,7 @@ def adam_update(params, grads, opt_state, lr, beta1=0.9, beta2=0.999, epsilon=1e
 simple_grad_update_jit = jit(simple_grad_update)
 adam_update_jit = jit(adam_update)
 
+# --- Activation Functions ---
 @jit
 def relu(x):
     return jnp.maximum(x, 0)
@@ -120,6 +122,7 @@ def linear_interpolat(start, end, end_t, cur_t):
         else:
             return (end - start) * jnp.minimum(cur_t, end_t) / end_t
 
+# --- Optimizers ---
 class simple_grad_optimizer():
     def __init__(self, learning_rate):
         self.learning_rate = learning_rate
@@ -166,7 +169,6 @@ def plot(curves, names, mv_n=100, end_n=1000, xlabel="Episodes", ylabel="Running
          ylim=None, loc=4, save=True, save_dir="./result/plots/", filename="plot.png"):
     plt.figure(figsize=(10, 7), dpi=150)
     colors = ['red', 'blue', 'green', 'crimson', 'orange', 'purple', 'cyan', 'magenta', 'yellow', 'black']
-
     for i, m in enumerate(names.keys()):
         v = jnp.array([mv(ep[:end_n], mv_n) for ep in curves[m][0]])
         v_mean = jnp.mean(v, axis=0)
@@ -201,6 +203,7 @@ def print_stat(curves, names):
         print("Return: avg. %.2f median %.2f min %.2f max %.2f std %.2f" %
               (np.average(r), np.median(r), np.amin(r), np.amax(r), np.std(r)))
 
+# --- Activation Type Constants ---
 L_SOFTPLUS = 0
 L_RELU = 1
 L_LINEAR = 2
@@ -213,11 +216,12 @@ ACT_F = {L_SOFTPLUS: softplus,
          L_SIGMOID: sigmoid,
          L_LINEAR: lambda x: x}
 
-ACT_D_F = {L_SOFTPLUS: sigmoid,
+ACT_D_F = {L_SOFTPLUS: sigmoid,  # derivative of softplus is sigmoid
            L_RELU: relu_d,
            L_SIGMOID: sigmoid_d,
            L_LINEAR: lambda x: 1}
 
+# --- Refactored eq_prop_layer ---
 class eq_prop_layer():
     def __init__(self, name, input_size, output_size, optimizer, var, temp, l_type):
         if l_type not in [L_SOFTPLUS, L_RELU, L_LINEAR, L_SIGMOID, L_DISCRETE]:
@@ -271,31 +275,33 @@ class eq_prop_layer():
         if not freeze_value:
             self.values = self.new_values
 
-    def update(self, update_size):
+    def update(self, update_size, rng):
+        # For layers with no next_layer, sample new values using the provided RNG.
         if self.next_layer is None:
             if self.l_type in LS_REAL:
                 sigma = jnp.sqrt(1 / self._inv_var)
-                self.new_values = self.mean + sigma * jax.random.normal(
-                    jax.random.PRNGKey(random.randint(0, 2**31 - 1)), shape=self.pot.shape)
+                rng, subkey = jax.random.split(rng)
+                self.new_values = self.mean + sigma * jax.random.normal(subkey, shape=self.pot.shape)
             elif self.l_type == L_DISCRETE:
-                self.new_values = multinomial_rvs(
-                    jax.random.PRNGKey(random.randint(0, 2**31 - 1)), 1, self.mean)[1]
-        elif self.l_type in LS_REAL:
+                rng, subkey = jax.random.split(rng)
+                rng, sample = multinomial_rvs(subkey, 1, self.mean)
+                self.new_values = sample
+            return rng
+        # Otherwise, update deterministically using feedback from next layer.
+        if self.l_type in LS_REAL:
             lower_pot = (self.mean - self.values) * self._inv_var
-            if self.next_layer is None:
-                upper_pot = 0.
+            fb_w = self.next_layer._w.T
+            if self.next_layer.l_type in LS_REAL:
+                upper_pot = jnp.dot((self.next_layer.values - self.next_layer.mean) *
+                                      ACT_D_F[self.next_layer.l_type](self.next_layer.pot) *
+                                      self.next_layer._inv_var,
+                                      fb_w)
             else:
-                fb_w = self.next_layer._w.T
-                if self.next_layer.l_type in LS_REAL:
-                    upper_pot = jnp.dot((self.next_layer.values - self.next_layer.mean) *
-                                          ACT_D_F[self.next_layer.l_type](self.next_layer.pot) *
-                                          self.next_layer._inv_var,
-                                          fb_w)
-                else:
-                    upper_pot = jnp.dot((self.next_layer.values - self.next_layer.mean), fb_w) / self.next_layer.temp
+                upper_pot = jnp.dot((self.next_layer.values - self.next_layer.mean), fb_w) / self.next_layer.temp
             update_pot = lower_pot + upper_pot
             update_step = update_size * update_pot
             self.new_values = self.values + update_step
+        return rng
 
     def record_trace(self, gate=None, lambda_=0):
         if self.l_type in LS_REAL:
@@ -312,7 +318,6 @@ class eq_prop_layer():
         b_update = self.b_trace * reward[:, None]
         w_update = jnp.mean(w_update, axis=0)
         b_update = jnp.mean(b_update, axis=0)
-
         self._w, self.opt_state_w = adam_update_jit(self._w, w_update, self.opt_state_w, lr)
         self._b, self.opt_state_b = adam_update_jit(self._b, b_update, self.opt_state_b, lr)
 
@@ -325,6 +330,7 @@ class eq_prop_layer():
         self.values = self.values * mask[:, None]
         self.new_values = self.new_values * mask[:, None]
 
+# --- Refactored Network ---
 class Network():
     def __init__(self, state_n, action_n, hidden, var, temp, hidden_l_type, output_l_type):
         self.layers = []
@@ -347,16 +353,18 @@ class Network():
         self.action = h
         return rng, self.action
 
-    def map_grad_ascent(self, steps, state=None, gate=False, lambda_=0, update_size=0.01):
+    def map_grad_ascent(self, steps, state=None, gate=False, lambda_=0, update_size=0.01, rng=None):
+        # Thread the RNG key through all layer updates.
         for i in range(steps):
             for n, a in enumerate(self.layers if state is not None else self.layers[:-1]):
-                a.update(getl(update_size, n))
+                rng = a.update(getl(update_size, n), rng)
             for n, a in enumerate(self.layers):
                 a.refresh(freeze_value=(n == (len(self.layers) - 1) and state is None))
             if i == steps - 1:
                 gate_c = 1 / (self.layers[-1].values - self.layers[-1].mean)[:, 0] if gate else None
                 for a in self.layers:
                     a.record_trace(gate=gate_c, lambda_=lambda_)
+        return rng
 
     def learn(self, reward, lr=0.01):
         for n, a in enumerate(self.layers):
@@ -370,6 +378,7 @@ class Network():
         for a in self.layers:
             a.clear_values(mask)
 
+# --- Main Training Loop & Environment Wrapper ---
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-c", "--config", required=False, default="config_cp.ini",
@@ -377,10 +386,8 @@ def main():
     args = ap.parse_args()
     f_name = os.path.join("config", f"{args.config}")
     print("Loading config from", f_name)
-
     config = configparser.ConfigParser(inline_comment_prefixes="#")
     config.read(f_name)
-
     name = config.get("USER", "name")
     max_eps = config.getint("USER", "max_eps")
     n_run = config.getint("USER", "n_run")
@@ -404,22 +411,16 @@ def main():
     actor_lr_st = json.loads(config.get("USER", "actor_lr_st"))
     actor_lr_end = json.loads(config.get("USER", "actor_lr_end"))
     end_t = config.getint("USER", "end_t")
-
     env = BatchEnvs(name=env_name, batch_size=batch_size, rest_n=0, warm_n=0)
     dis_act = type(env.action_space) != gymnax.environments.spaces.Box
-
     critic_update_size = [i * critic_update_adj for i in critic_var]
     actor_update_size = [i * actor_update_adj for i in actor_var]
     critic_lambda_ *= gamma
     actor_lambda_ *= gamma
-
-    print_every = 1000
+    print_every = 5000
     eps_ret_hist_full = []
-
     print("Starting experiments on environment", env_name)
-
     rng = jax.random.PRNGKey(0)
-
     for j in range(n_run):
         critic_net = Network(state_n=env.state.shape[1], action_n=1, hidden=hidden, var=critic_var, 
                                temp=None, hidden_l_type=critic_l_type, output_l_type=L_LINEAR)
@@ -427,64 +428,49 @@ def main():
         action_n = env.action_space.n if dis_act else env.action_space.shape[0]
         actor_net = Network(state_n=env.state.shape[1], action_n=action_n, hidden=hidden, var=actor_var, 
                             temp=temp, hidden_l_type=actor_l_type, output_l_type=output_l_type)
-        
         eps_ret_hist = []  
         c_eps_ret = jnp.zeros(batch_size)
-            
         print_count = print_every         
-        isEnd = env.isEnd
         prev_isEnd = env.isEnd
         state = env.reset()
         value_old = None
-
-        for i in range(int(1e9)):     
+        for i in range(int(1e9)):
             rng, action = actor_net.forward(state, rng)
             if not dis_act:
                 action = action * (env.action_space.high[0] - env.action_space.low[0]) - env.action_space.low[0]
                 action = jnp.clip(action, env.action_space.low, env.action_space.high)
-            
             rng, critic_out = critic_net.forward(state, rng)
             value_new = critic_out[:,0]
             mean_value_new = critic_net.layers[-1].mean[:,0]   
-            
-            if value_old is not None:      
-                if reward_lim > 0:
-                    reward = jnp.clip(env.reward, -reward_lim, +reward_lim)
-                else:
-                    reward = env.reward
+            # 2. REINFORCE phase
+            if value_old is not None:
+                reward = jnp.clip(env.reward, -reward_lim, +reward_lim) if reward_lim > 0 else env.reward
                 targ_value = reward + gamma * mean_value_new * (~env.isEnd).astype(float)      
                 critic_reward = targ_value - mean_value_old
                 critic_reward = critic_reward.at[prev_isEnd].set(0)
                 actor_reward = targ_value - mean_value_old
                 actor_reward = actor_reward.at[prev_isEnd].set(0)            
-                
                 cur_critic_lr = linear_interpolat(start=critic_lr_st, end=critic_lr_end, end_t=end_t, cur_t=i)
                 cur_actor_lr = linear_interpolat(start=actor_lr_st, end=actor_lr_end, end_t=end_t, cur_t=i)  
-                
                 critic_net.learn(critic_reward, lr=cur_critic_lr)      
-                actor_net.learn(actor_reward, lr=cur_actor_lr)          
-        
+                actor_net.learn(actor_reward, lr=cur_actor_lr)   
+            # 3. Minimize Energy phase       
             critic_net.clear_trace(~prev_isEnd)
-            critic_net.map_grad_ascent(steps=map_grad_ascent_steps, state=None, gate=True, lambda_=critic_lambda_, 
-                            update_size=critic_update_size)           
+            rng = critic_net.map_grad_ascent(steps=map_grad_ascent_steps, state=None, gate=True, lambda_=critic_lambda_, 
+                                             update_size=critic_update_size, rng=rng)
             actor_net.clear_trace(~prev_isEnd)  
-            actor_net.map_grad_ascent(steps=map_grad_ascent_steps, state=None, gate=None, lambda_=actor_lambda_, 
-                                    update_size=actor_update_size)              
-
+            rng = actor_net.map_grad_ascent(steps=map_grad_ascent_steps, state=None, gate=False, lambda_=actor_lambda_, 
+                                            update_size=actor_update_size, rng=rng)
             value_old = value_new
             mean_value_old = mean_value_new
             prev_isEnd = env.isEnd   
             state, reward, isEnd, info = env.step(from_one_hot(action) if dis_act else action)
-            
             c_eps_ret += reward
-            
             if jnp.any(isEnd):
                 eps_ret_hist.extend(c_eps_ret[isEnd].tolist())
                 c_eps_ret = c_eps_ret.at[isEnd].set(0.)
-            
             if len(eps_ret_hist) >= max_eps:
                 break       
-            
             if i * batch_size > print_count and len(eps_ret_hist) > 0:      
                 eps_ret_hist_jp = jnp.array(eps_ret_hist)
                 f_str = "Run %d: Step %d Eps %d\t Running Avg. Return %f\t Max Return %f \t"
@@ -492,7 +478,6 @@ def main():
                 print(f_str % tuple(f_arg))
                 print_count += print_every          
         eps_ret_hist_full.append(eps_ret_hist)
-
     print("Finished Training")
     curves = {}  
     curves[name] = (eps_ret_hist_full,)
@@ -508,37 +493,29 @@ class BatchEnvs:
         self.batch_size = int(batch_size)
         self.rest_n = rest_n
         self.warm_n = warm_n
-
         self.rollout_wrapper = RolloutWrapper(env_name=name)
         self.env = self.rollout_wrapper.env
         self.env_params = self.rollout_wrapper.env_params
-
         self._gym_action_space = gym.make(name).action_space
-
         self.key = jax.random.PRNGKey(0)
-
         keys = jax.random.split(self.key, self.batch_size)
         obs, full_state = jax.vmap(self.env.reset, in_axes=(0, None))(keys, self.env_params)
         self._obs = obs
         self._full_state = full_state
-
         self._rest = jnp.zeros(self.batch_size)
         self._warm = jnp.zeros(self.batch_size)
         self._stateCode = jnp.zeros(self.batch_size, dtype=jnp.int32)
-
         self.reward = jnp.zeros(self.batch_size)
         self.done = jnp.zeros(self.batch_size, dtype=bool)
         self.info = {"stateCode": self._stateCode,
                      "truncatedEnd": jnp.zeros(self.batch_size, dtype=bool)}
 
     def reset(self):
-        """Reset all environments and counters; return the observation."""
         self.key, subkey = jax.random.split(self.key)
         keys = jax.random.split(subkey, self.batch_size)
         obs, full_state = jax.vmap(self.env.reset, in_axes=(0, None))(keys, self.env_params)
         self._obs = obs
         self._full_state = full_state
-
         self._rest = jnp.zeros(self.batch_size)
         self._warm = jnp.zeros(self.batch_size)
         self._stateCode = jnp.zeros(self.batch_size, dtype=jnp.int32)
@@ -549,35 +526,27 @@ class BatchEnvs:
         return self.observation
 
     def step(self, actions):
-        # Generate a separate rng key for each environment in the batch.
         self.key, subkey = jax.random.split(self.key)
         step_keys = jax.random.split(subkey, self.batch_size)
-
         step_fn = lambda key, st, action: self.env.step(key, st, action, self.env_params)
-
         next_obs, next_state, reward, done, info = jax.vmap(step_fn, in_axes=(0, 0, 0))(
             step_keys, self._full_state, actions
         )
-
         self._rest = self._rest + jnp.where(done, 1, 0)
         self._warm = self._warm + 1
-        self._full_state = next_state 
-        self._obs = next_obs      
-
+        self._full_state = next_state
+        self._obs = next_obs
         self.reward = reward
         self.done = done
-        self.info = info 
-
+        self.info = info
         return self._obs, self.reward, self.done, self.info
 
     @property
     def observation(self):
-        """Return the observation for training (not the full state)."""
         return self._obs
 
     @property
     def full_state(self):
-        """Return the full environment state (for internal use)."""
         return self._full_state
       
     @property
