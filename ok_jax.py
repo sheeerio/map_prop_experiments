@@ -244,23 +244,25 @@ class MNIST_MDP(MDP):
         self.n_classes = 10
         self.gamma = gamma
         self.rng = jax.random.PRNGKey(random.randint(0, 2**31 - 1))
+        
+        # **NEW**: Initialize epoch ordering and pointer for sequential batching.
+        self.epoch_indices = np.arange(self.dataset_size)
+        np.random.shuffle(self.epoch_indices)  # Shuffle for the first epoch.
+        self.current_index = 0
 
     def reset(self, batch_size):
-        # Randomly sample batch indices from the stored dataset
-        self.rng, subkey = jax.random.split(self.rng)
-        indices = jax.random.randint(subkey, shape=(batch_size,), minval=0, maxval=self.dataset_size)
+        # **NEW**: Instead of randomly sampling indices, use sequential batches.
+        if self.current_index + batch_size > self.dataset_size:
+            # End of epoch reached, reshuffle indices and reset pointer.
+            np.random.shuffle(self.epoch_indices)
+            self.current_index = 0
+        indices = self.epoch_indices[self.current_index:self.current_index + batch_size]
+        self.current_index += batch_size
         self.current_X = self.X[indices]
         self.current_y = self.y[indices]
         return self.current_X
 
     def act(self, actions):
-        """
-        Compare the predicted actions with the stored labels.
-        If actions are one-hot, convert them to discrete labels.
-        Returns an advantage signal computed as:
-           advantage = raw_reward - batch_mean(raw_reward)
-        where raw_reward = 1.0 if correct and 0.0 if incorrect.
-        """
         if actions.ndim > 1 and actions.shape[1] > 1:
             pred = jnp.argmax(actions, axis=1)
         else:
@@ -689,7 +691,7 @@ def main():
                 action = zero_to_neg(from_one_hot(action))[:, jnp.newaxis]
                 reward = env.act(action)[:, 0]
             elif args.env_name == "Regression":
-                action = action[:, 0]
+                action =   action[:, 0]
                 reward = env.act(action)
             elif args.env_name == "MNIST":
                 # If the network output is one-hot, convert to label indices.
