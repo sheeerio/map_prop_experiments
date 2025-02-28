@@ -223,27 +223,30 @@ class complex_multiplexer_MDP(MDP):
 
 class MNIST_MDP(MDP):
     def __init__(self, train=True, gamma=1.0):
-        # Load MNIST from keras
-        from keras.datasets import mnist
-        (X_train, y_train), (X_test, y_test) = mnist.load_data()
-        # Use training or testing data
-        X = X_train if train else X_test
-        y = y_train if train else y_test
-
-        # Flatten images (28x28 -> 784) and normalize to [0,1]
-        X = X.reshape(-1, 28 * 28).astype('float32') / 255.0
-
-        # Convert to JAX arrays
+        import tensorflow_datasets as tfds
+        import tensorflow as tf
+        # Load the dataset via tfds (using the 'as_supervised' flag)
+        split = 'train' if train else 'test'
+        ds = tfds.load('mnist', split=split, as_supervised=True)
+        # Normalize images and cast them to float32
+        ds = ds.map(lambda img, label: (tf.cast(img, tf.float32) / 255.0, label))
+        # Batch the entire dataset to load it into memory (MNIST is small)
+        ds = ds.batch(60000)
+        for img, label in ds.take(1):
+            X = img.numpy()
+            y = label.numpy()
+        # Flatten images: 28x28 -> 784
+        X = X.reshape(-1, 28 * 28)
         self.X = jnp.array(X)
         self.y = jnp.array(y)
         self.dataset_size = self.X.shape[0]
         self.x_size = 28 * 28
         self.n_classes = 10
-        self.gamma = gamma  # Discount factor (for one-step returns, gamma=1 is typical)
+        self.gamma = gamma
         self.rng = jax.random.PRNGKey(random.randint(0, 2**31 - 1))
 
     def reset(self, batch_size):
-        # Randomly sample batch indices from the dataset
+        # Randomly sample batch indices from the stored dataset
         self.rng, subkey = jax.random.split(self.rng)
         indices = jax.random.randint(subkey, shape=(batch_size,), minval=0, maxval=self.dataset_size)
         self.current_X = self.X[indices]
@@ -254,25 +257,19 @@ class MNIST_MDP(MDP):
         """
         Compare the predicted actions with the stored labels.
         If actions are one-hot, convert them to discrete labels.
-        Returns a reward of +1 if correct and -1 if incorrect.
-        The reward is then baseline-corrected by subtracting the batch mean.
+        Returns an advantage signal computed as:
+           advantage = raw_reward - batch_mean(raw_reward)
+        where raw_reward = 1.0 if correct and 0.0 if incorrect.
         """
-        # Convert one-hot predictions to labels if needed.
         if actions.ndim > 1 and actions.shape[1] > 1:
             pred = jnp.argmax(actions, axis=1)
         else:
             pred = actions.flatten()
-        # print(pred, self.current_y)
-        # Raw reward: +1 for correct, -1 for incorrect.
         raw_reward = jnp.where(pred == self.current_y, 1.0, 0.0)
-        # # # Compute baseline as the mean reward of the batch.
-        # baseline = jnp.mean(raw_reward)
-        # advantage = raw_reward - baseline
-        # # print(advantage)
-        # # # # Apply gamma (for multi-step returns, here gamma=1 is typical)
-        # # discounted_reward = self.gamma * advantage
-        # return advantage.reshape(-1, 1)
+        baseline = jnp.mean(raw_reward)
+        advantage = raw_reward - baseline
         return raw_reward.reshape(-1,1)
+        return advantage.reshape(-1, 1)
 
 @jax.jit
 def act_complex_multiplexer(y, actions, reward_zero):
@@ -574,6 +571,11 @@ def main():
         help="JSON list of hidden units per layer (e.g., '[64, 32]')."
     )
     parser.add_argument(
+      "--print_every",
+      type=int,
+      default=config.get("DEFAULT", "print_every")
+    )
+    parser.add_argument(
         "--l_type",
         type=int,
         choices=[0, 1, 2, 3, 4],
@@ -664,7 +666,7 @@ def main():
         sys.exit(1)
 
     update_size = [i * args.update_adj for i in var]
-    print_every = 128 * 50
+    print_every = args.batch_size * args.print_every
 
     eps_ret_hist_full = []
     net = Network(
