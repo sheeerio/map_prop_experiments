@@ -226,12 +226,12 @@ class MNIST_MDP(MDP):
         import tensorflow_datasets as tfds
         import tensorflow as tf
         # Load the dataset via tfds (using the 'as_supervised' flag)
-        split = 'train' if train else 'test'
+        split = 'train[:10000]' if train else 'test'
         ds = tfds.load('mnist', split=split, as_supervised=True)
         # Normalize images and cast them to float32
         ds = ds.map(lambda img, label: (tf.cast(img, tf.float32) / 255.0, label))
         # Batch the entire dataset to load it into memory (MNIST is small)
-        ds = ds.batch(60000)
+        ds = ds.batch(10000)
         for img, label in ds.take(1):
             X = img.numpy()
             y = label.numpy()
