@@ -672,14 +672,14 @@ def main():
 
     eps_ret_hist_full = []
     net = Network(
-              state_n=env.x_size,
-              action_n=action_n,
-              hidden=hidden,
-              var=var,
-              temp=args.temp,
-              hidden_l_type=args.l_type,
-              output_l_type=output_l_type
-          )
+            state_n=env.x_size,
+            action_n=action_n,
+            hidden=hidden,
+            var=var,
+            temp=args.temp,
+            hidden_l_type=args.l_type,
+            output_l_type=output_l_type
+        )
     for j in range(args.n_run):
         eps_ret_hist = []
         print_count = print_every
