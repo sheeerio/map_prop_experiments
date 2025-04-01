@@ -390,7 +390,7 @@ class eq_prop_layer():
                 self.values = self.mean
                 return self.values
             self.rng, subkey = jax.random.split(self.rng)
-            self.rng, sampled = multinomial_rvs(subkey, 1, self.mean)
+            self.rng, sampled = jax.random.multinomial(subkey, 1, self.mean)
             self.values = sampled
             return self.values
 
@@ -410,7 +410,7 @@ class eq_prop_layer():
                 self.new_values = self.mean + sigma * jax.random.normal(subkey, shape=self.pot.shape)
             elif self.l_type == L_DISCRETE:
                 self.rng, subkey = jax.random.split(self.rng)
-                self.rng, sampled = multinomial_rvs(subkey, 1, self.mean)
+                self.rng, sampled = jax.random.multinomial(subkey, 1, self.mean)
                 self.new_values = sampled
         # layers except output layer
         elif self.l_type in LS_REAL:
@@ -511,7 +511,7 @@ def main():
     initial_parser = argparse.ArgumentParser(add_help=False)
     initial_parser.add_argument(
         "-c", "--config",
-        default="config_mp.ini",
+        default="config_mn.ini",
         help="Location of config file (default: config_mp.ini)"
     )
     args, remaining_argv = initial_parser.parse_known_args()
