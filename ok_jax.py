@@ -361,8 +361,6 @@ class eq_prop_layer():
         self.opt_state_w = {'m': jnp.zeros_like(self._w), 'v': jnp.zeros_like(self._w), 't': 0}
         self.opt_state_b = {'m': jnp.zeros_like(self._b), 'v': jnp.zeros_like(self._b), 't': 0}
         
-
-
         self.prev_layer = None
         self.next_layer = None
         self.values = jnp.zeros((1, output_size))
@@ -371,66 +369,68 @@ class eq_prop_layer():
         self.b_trace = jnp.zeros((1, output_size))
 
     def compute_pot_mean(self, inputs):
-        self.inputs = inputs
-        self.pot = jnp.dot(inputs, self._w) + self._b
+        pot = jnp.dot(inputs, self._w) + self._b
         if self.l_type in LS_REAL:
-            self.mean = ACT_F[self.l_type](self.pot)
+            mean = ACT_F[self.l_type](pot)
         else:
-            self.mean = softmax(self.pot / self.temp, axis=-1)
+            mean = softmax(pot / self.temp, axis=-1)
+        return pot, mean  # MODIFIED: Now returns values instead of storing in self.
 
     def sample(self, inputs):
-        self.compute_pot_mean(inputs)
+        pot, mean = self.compute_pot_mean(inputs)
         if self.l_type in LS_REAL:
             sigma = jnp.sqrt(1 / self._inv_var)
             self.rng, subkey = jax.random.split(self.rng)
-            self.values = self.mean + sigma * jax.random.normal(subkey, shape=self.pot.shape)
-            return self.values
+            values = mean + sigma * jax.random.normal(subkey, shape=pot.shape)
+            return values
         elif self.l_type == L_DISCRETE:
-            if self.next_layer is None:
-                self.values = self.mean
-                return self.values
             self.rng, subkey = jax.random.split(self.rng)
-            self.rng, sampled = jax.random.multinomial(subkey, 1, self.mean)
-            self.values = sampled
-            return self.values
+            sampled = jax.random.multinomial(subkey, 1, mean)
+            return sampled
+
+
 
     def refresh(self, freeze_value):
         if self.prev_layer is not None:
             self.inputs = self.prev_layer.new_values
-        self.compute_pot_mean(self.inputs)
+        # MODIFIED: Capture computed values and store them for later use.
+        pot, mean = self.compute_pot_mean(self.inputs)
+        self.pot = pot
+        self.mean = mean
         if not freeze_value:
             self.values = self.new_values
 
     def update(self, update_size):
+        # MODIFIED: Compute current pot and mean locally instead of using stored self.mean/self.pot.
+        pot, mean = self.compute_pot_mean(self.inputs)
         # output layer
         if self.next_layer is None:
             if self.l_type in LS_REAL:
                 sigma = jnp.sqrt(1 / self._inv_var)
                 self.rng, subkey = jax.random.split(self.rng)
-                self.new_values = self.mean + sigma * jax.random.normal(subkey, shape=self.pot.shape)
+                self.new_values = mean + sigma * jax.random.normal(subkey, shape=pot.shape)
             elif self.l_type == L_DISCRETE:
                 self.rng, subkey = jax.random.split(self.rng)
-                self.rng, sampled = jax.random.multinomial(subkey, 1, self.mean)
+                self.rng, sampled = jax.random.multinomial(subkey, 1, mean)
                 self.new_values = sampled
-        # layers except output layer
         elif self.l_type in LS_REAL:
-            lower_pot = (self.mean - self.values) * self._inv_var
-            if self.next_layer is None:
-                upper_pot = 0.
+            lower_pot = (mean - self.values) * self._inv_var
+            fb_w = self.next_layer._w.T
+            # For the next layer, compute its pot and mean from its current inputs.
+            next_pot, next_mean = self.next_layer.compute_pot_mean(self.next_layer.inputs)
+            if self.next_layer.l_type in LS_REAL:
+                upper_pot = jnp.dot((self.next_layer.values - next_mean) *
+                                    ACT_D_F[self.next_layer.l_type](next_pot) *
+                                    self.next_layer._inv_var,
+                                    fb_w)
             else:
-                fb_w = self.next_layer._w.T
-                if self.next_layer.l_type in LS_REAL:
-                    upper_pot = jnp.dot((self.next_layer.values - self.next_layer.mean) *
-                                          ACT_D_F[self.next_layer.l_type](self.next_layer.pot) *
-                                          self.next_layer._inv_var,
-                                          fb_w)
-                else:
-                    upper_pot = jnp.dot((self.next_layer.values - self.next_layer.mean), fb_w) / self.next_layer.temp
+                upper_pot = jnp.dot((self.next_layer.values - next_mean), fb_w) / self.next_layer.temp
             update_pot = lower_pot + upper_pot
             update_step = update_size * update_pot
             self.new_values = self.values + update_step
 
     def record_trace(self, gate=None, lambda_=0):
+        # Uses stored self.mean and self.pot from refresh()
         if self.l_type in LS_REAL:
             v_ch = (self.values - self.mean) * ACT_D_F[self.l_type](self.pot) * self._inv_var
         else:
@@ -557,7 +557,7 @@ def main():
     parser.add_argument(
         "--env_name",
         default=config.get("DEFAULT", "env_name"),
-        choices=["Multiplexer", "Regression"],
+        choices=["Multiplexer", "Regression", "MNIST"],
         help="Environment name (e.g., Multiplexer, Regression)."
     )
     parser.add_argument(
@@ -600,7 +600,7 @@ def main():
         "--update_adj",
         type=float,
         default=config.getfloat("DEFAULT", "update_adj"),
-        help="Step size for energy minimization adjustment."
+        help="Step size for minimizing the energy of the network equals to the layer's variance multiplied by this constant"
     )
     parser.add_argument(
         "--map_grad_ascent_steps",
@@ -662,12 +662,14 @@ def main():
         gate = False
         output_l_type = L_DISCRETE
         action_n = env.n_classes
-
+    elif args.env_name == "Regression":
+        # Add your Regression environment here if needed
+        print("Error: Regression environment not implemented.")
+        sys.exit(1)
     else:
         print(f"Error: Unsupported environment '{args.env_name}'.")
         sys.exit(1)
 
-    update_size = [i * args.update_adj for i in var]
     print_every = args.batch_size * args.print_every
 
     eps_ret_hist_full = []
@@ -680,34 +682,54 @@ def main():
             hidden_l_type=args.l_type,
             output_l_type=output_l_type
         )
+
+    # Initialize learnable update_adj and its optimizer state
+    meta_lr = 1e-3 
+    update_adj = jnp.array(args.update_adj, dtype=jnp.float32)
+    meta_opt_state_update_adj = {'m': jnp.zeros_like(update_adj),
+                                 'v': jnp.zeros_like(update_adj),
+                                 't': 0}
+
+    # Define differentiable training step for meta-learning
+    def training_step(ua):
+        current_update_size = [i * ua for i in var]
+        state_ts = env.reset(args.batch_size)
+        action_ts = net.forward(state_ts)
+        if args.env_name == "Multiplexer":
+            action_ts = zero_to_neg(from_one_hot(action_ts))[:, jnp.newaxis]
+            reward_ts = env.act(action_ts)[:, 0]
+        elif args.env_name == "Regression":
+            action_ts = action_ts[:, 0]
+            reward_ts = env.act(action_ts)
+        elif args.env_name == "MNIST":
+            action_ts = jnp.argmax(action_ts, axis=1)
+            reward_ts = env.act(action_ts)[:, 0]
+        net.map_grad_ascent(steps=args.map_grad_ascent_steps, state=None, gate=gate, lambda_=0, update_size=current_update_size)
+        net.learn(reward_ts, lr=lr)
+        return -jnp.mean(reward_ts)
+
     for j in range(args.n_run):
         eps_ret_hist = []
         print_count = print_every
         for i in range(args.max_eps // args.batch_size):
-            # print("Bang bang")
             state = env.reset(args.batch_size)
             action = net.forward(state)
             if args.env_name == "Multiplexer":
                 action = zero_to_neg(from_one_hot(action))[:, jnp.newaxis]
                 reward = env.act(action)[:, 0]
             elif args.env_name == "Regression":
-                action =   action[:, 0]
+                action = action[:, 0]
                 reward = env.act(action)
             elif args.env_name == "MNIST":
-                # If the network output is one-hot, convert to label indices.
                 action = jnp.argmax(action, axis=1)
                 reward = env.act(action)[:, 0]
 
             eps_ret_hist.append(np.average(np.array(reward)))
 
-            # 2. MAP-Prop Update phase
-            net.map_grad_ascent(
-                steps=args.map_grad_ascent_steps,
-                state=None,
-                gate=gate,
-                lambda_=0,
-                update_size=update_size
-            )
+            current_update_size = [i * update_adj for i in var]
+
+            # 2. MAP-Prop update
+            net.map_grad_ascent(steps=args.map_grad_ascent_steps, state=None, gate=gate, lambda_=0, update_size=current_update_size)
            
             if args.env_name == "Regression":
                 reward = env.y - net.layers[-1].mean[:, 0]
@@ -715,9 +737,13 @@ def main():
             # 3. REINFORCE phase
             net.learn(reward, lr=lr)
 
+            # Meta-update for update_adj
+            meta_loss_val, grad_update_adj = jax.value_and_grad(training_step)(update_adj)
+            update_adj, meta_opt_state_update_adj = adam_update_jit(update_adj, grad_update_adj, meta_opt_state_update_adj, meta_lr)
+
             if (i * args.batch_size) > print_count:
                 running_avg = np.average(eps_ret_hist[-print_every // args.batch_size:])
-                print(f"Run {j} Step {i} Running Avg. Reward\t{running_avg:.6f}")
+                print(f"Run {j} Step {i} Running Avg. Reward\t{running_avg:.6f} Update Adj.\t{update_adj:.2f}")
                 print_count += print_every
         eps_ret_hist_full.append(eps_ret_hist)
 
