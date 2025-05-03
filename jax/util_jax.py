@@ -17,33 +17,34 @@ def jax_relu(x) -> jax.Array:
     assert isinstance(x, jax.Array) or isinstance(x, np.ndarray)
     return jnp.where(x < 0, 0, x)
 
+
 @jit
 def jax_relu_grad(x):
     assert isinstance(x, jax.Array) or isinstance(x, np.ndarray)
     return jnp.where(x < 0, 0, 1)
 
+
 @jit
 def jax_sigmoid(x):
     assert isinstance(x, jax.Array or isinstance(x, np.ndarray))
     lim = 20
-    return jnp.where(x >= lim, 1, 
-        jnp.where(x <= -lim, 0, 
-            jnp.where(
-                jnp.abs(x) < lim, 1/(1+jnp.exp(-x)), x
-            )
-        )
+    return jnp.where(
+        x >= lim,
+        1,
+        jnp.where(x <= -lim, 0, jnp.where(jnp.abs(x) < lim, 1 / (1 + jnp.exp(-x)), x)),
     )
+
 
 @jit
 def jax_sigmoid_grad(x):
     s = jax_sigmoid(x)
-    return s * (1-s)
+    return s * (1 - s)
+
 
 @jit
 def jax_softplus(x):
-    return jnp.where(
-        x > 30, x, jnp.log1p(jnp.exp(x))
-    )
+    return jnp.where(x > 30, x, jnp.log1p(jnp.exp(x)))
+
 
 # @jit
 def jax_softmax(X, theta=1.0, axis=None):
@@ -52,11 +53,13 @@ def jax_softmax(X, theta=1.0, axis=None):
         axis = next(j[0] for j in enumerate(y.shape) if j[1] > 1)
     y *= float(theta)
     y -= jnp.expand_dims(jnp.max(y, axis=axis), axis)
-    y = jnp.where(y<-30, jnp.exp(-30), jnp.exp(y))
+    y = jnp.where(y < -30, jnp.exp(-30), jnp.exp(y))
     ax_sum = jnp.expand_dims(jnp.sum(y, axis=axis), axis)
-    p = y/ax_sum
-    if len(X.shape) == 1 : p = jnp.ravel(p)
+    p = y / ax_sum
+    if len(X.shape) == 1:
+        p = jnp.ravel(p)
     return p
+
 
 @jit
 def jax_multinomial_rvs(key, n, p):
@@ -69,6 +72,7 @@ def jax_multinomial_rvs(key, n, p):
     )
     condp = p / (1.0 - ps_prev)
     condp = jnp.where(jnp.isnan(condp), 0.0, condp)
+
     def body_fn(i, carry):
         key, count, out = carry
         key, subkey = jrandom.split(key)
@@ -76,43 +80,52 @@ def jax_multinomial_rvs(key, n, p):
         out = out.at[..., i].set(binsample)
         count = count - binsample
         return key, count, out
+
     key, count, out = jax.lax.fori_loop(0, p.shape[-1] - 1, body_fn, (key, count, out))
     out = out.at[..., -1].set(count)
     return out
 
+
 @jit
 def jax_from_one_hot(y):
     return jnp.argmax(jnp.array(y), axis=-1)
+
 
 # @jit
 def jax_to_one_hot(a, size):
     oh = jnp.zeros((a.shape[0], size), dtype=int)
     return oh.at[jnp.arange(a.shape[0]), a.astype(int)].set(1)
 
+
 # @jit
 def jax_getl(x, n):
     return x[n] if type(x) == list else x
 
+
 @jit
 def jax_equal_zero(x):
-    return jnp.logical_and(jnp.where(x > -1e8, 1, 0),
-    jnp.where(x < 1e-8, 1, 0))
+    return jnp.logical_and(jnp.where(x > -1e8, 1, 0), jnp.where(x < 1e-8, 1, 0))
+
 
 @jit
 def jax_mask_neg(x):
     return (x < 0).astype(jnp.float32)
 
+
 @jit
 def jax_apply_mask(x, mask):
     return (x.T * mask).T
+
 
 @jit
 def jax_sign(x):
     return (x > 1e-8).astype(jnp.float32) - (x < -1e-8).astype(jnp.float32)
 
+
 @jit
 def jax_zero_to_neg(x):
     return (x > 1e-8).astype(jnp.float32) - (x <= 1e-8).astype(jnp.float32)
+
 
 @jit
 def jax_neg_to_zero(x):
@@ -123,16 +136,21 @@ def jax_neg_to_zero(x):
 def jax_linear_interpolat(start, end, end_t, cur_t):
     if type(start) == list:
         if type(end_t) == list:
-            return [(e - s) * min(cur_t, d) / d + s for (s, e, d) in zip(start, end, end_t)]
-        else:    
-            return [(e - s) * min(cur_t, end_t)  / end_t + s for (s, e) in zip(start, end)]
+            return [
+                (e - s) * min(cur_t, d) / d + s for (s, e, d) in zip(start, end, end_t)
+            ]
+        else:
+            return [
+                (e - s) * min(cur_t, end_t) / end_t + s for (s, e) in zip(start, end)
+            ]
     else:
         if type(end_t) == list:
             return [(end - start) * min(cur_t, d) / d + start for d in end_t]
-        else:          
+        else:
             return (end - start) * min(cur_t, end_t) / end_t + start
 
-class jax_simple_grad_optimizer():
+
+class jax_simple_grad_optimizer:
     def __init__(self, learning_rate):
         self.learning_rate = learning_rate
 
@@ -141,36 +159,40 @@ class jax_simple_grad_optimizer():
         learning_rate = self.learning_rate if learning_rate is None else learning_rate
         return [learning_rate * i for i in grads]
 
+
 @jit
 def compute_delta(g, m, v, beta_1, beta_2, t, learning_rate, epsilon):
     new_m = beta_1 * m + (1 - beta_1) * g
     new_v = beta_2 * v + (1 - beta_2) * jnp.power(g, 2)
     m_hat = new_m / (1 - jnp.power(beta_1, t))
     v_hat = new_v / (1 - jnp.power(beta_2, t))
-    delta = jnp.array([lr * m_hat / (jnp.sqrt(v_hat) + epsilon) for lr in learning_rate])
+    delta = jnp.array(
+        [lr * m_hat / (jnp.sqrt(v_hat) + epsilon) for lr in learning_rate]
+    )
     return delta, new_m, new_v
 
-class jax_adam_optimizer():
+
+class jax_adam_optimizer:
     def __init__(self, learning_rate, beta_1=0.9, beta_2=0.999, epsilon=1e-09):
         self.beta_1 = beta_1
         self.beta_2 = beta_2
         self.learning_rate = learning_rate
         self.epsilon = epsilon
-        self._cache = {}    
-    
+        self._cache = {}
+
     def delta(self, grads, name="w", learning_rate=None, gate=None):
         if name not in self._cache:
             self._cache[name] = [
                 [jnp.zeros_like(i) for i in grads],
                 [jnp.zeros_like(i) for i in grads],
-                0
+                0,
             ]
         self._cache[name][2] += 1
         t = self._cache[name][2]
         deltas = []
         beta_1, beta_2 = self.beta_1, self.beta_2
         learning_rate = self.learning_rate if learning_rate is None else learning_rate
-        
+
         for n, g in enumerate(grads):
             m = self._cache[name][0][n]
             v = self._cache[name][1][n]
@@ -180,26 +202,28 @@ class jax_adam_optimizer():
             self._cache[name][0][n] = new_m
             self._cache[name][1][n] = new_v
             deltas.append(delta_n)
-        
+
         return deltas
 
-class MDP(ABC): 
-  def __init__(self):
-    super().__init__()        
 
-  @abstractmethod
-  def reset(self, batch_size):
-    pass
+class MDP(ABC):
+    def __init__(self):
+        super().__init__()
 
-  @abstractmethod
-  def act(self, actions):
-    pass
+    @abstractmethod
+    def reset(self, batch_size):
+        pass
+
+    @abstractmethod
+    def act(self, actions):
+        pass
+
 
 class jax_complex_multiplexer_MDP(MDP):
     def __init__(self, addr_size=2, action_size=2, zero=True, reward_zero=True):
         self.addr_size = addr_size
-        self.action_size = action_size      
-        self.x_size = addr_size * action_size + 2 ** addr_size
+        self.action_size = action_size
+        self.x_size = addr_size * action_size + 2**addr_size
         self.zero = zero
         self.reward_zero = reward_zero
         self.key = jrandom.PRNGKey(0)
@@ -219,17 +243,21 @@ class jax_complex_multiplexer_MDP(MDP):
         addr_size = self.addr_size
         action_size = self.action_size
         x_size = self.x_size
-        
+
         self.key, subkey = jrandom.split(self.key)
-        self.x = jrandom.bernoulli(subkey, p=0.5, shape=(batch_size, x_size)).astype(jnp.int32)
-        
+        self.x = jrandom.bernoulli(subkey, p=0.5, shape=(batch_size, x_size)).astype(
+            jnp.int32
+        )
+
         factors = 2 ** (addr_size - 1 - jnp.arange(addr_size))
-        reshaped = self.x[:, :addr_size * action_size].reshape(batch_size, action_size, addr_size)
+        reshaped = self.x[:, : addr_size * action_size].reshape(
+            batch_size, action_size, addr_size
+        )
         addr = jnp.sum(reshaped * factors, axis=2)  # shape: (batch_size, action_size)
-        
+
         col_indices = addr_size * action_size + addr  # shape: (batch_size, action_size)
         self.y = jnp.take_along_axis(self.x, col_indices, axis=1)
-        
+
         if not self.zero:
             self.y = jax_neg_to_zero(self.y)
             return jax_zero_to_neg(self.x)
@@ -252,8 +280,11 @@ class jax_complex_multiplexer_MDP(MDP):
         init_val = 0 if self.reward_zero else -1
         reward_f = jnp.full((self.x.shape[0], 2), init_val)
         y_zero = self.y if self.zero else jax_neg_to_zero(self.y)
-        reward_f = reward_f.at[jnp.arange(self.x.shape[0]), y_zero[:, 0].astype(jnp.int32)].set(1)
+        reward_f = reward_f.at[
+            jnp.arange(self.x.shape[0]), y_zero[:, 0].astype(jnp.int32)
+        ].set(1)
         return jnp.sum(reward_f * p, axis=-1)
+
 
 class jax_reg_MDP(MDP):
     def __init__(self, x_size=8, layers=2, load_file="reg.npy", clean=False):
@@ -296,7 +327,8 @@ class jax_reg_MDP(MDP):
         """
         Compute the (negative squared error) reward given actions.
         """
-        return -(actions - self.y) ** 2
+        return -((actions - self.y) ** 2)
+
 
 @tree_util.register_pytree_node_class
 @dataclass
@@ -328,6 +360,7 @@ class EnvWrapperState:
     def tree_unflatten(cls, aux_data, children):
         return cls(*children)
 
+
 def batch_reset(key, env, env_params, batch_size):
     """Reset a batch of gymnax environments and initialize counters."""
     keys = jrandom.split(key, batch_size)
@@ -339,9 +372,14 @@ def batch_reset(key, env, env_params, batch_size):
     rest = jnp.zeros(batch_size)
     warm = jnp.zeros(batch_size)
     state_code = jnp.zeros(batch_size, dtype=jnp.int32)
-    return EnvWrapperState(obs, env_state, reward, is_end, truncated_end, rest, warm, state_code)
+    return EnvWrapperState(
+        obs, env_state, reward, is_end, truncated_end, rest, warm, state_code
+    )
 
-def env_wrapper_step(key, state: EnvWrapperState, actions, env, env_params, rest_n, warm_n):
+
+def env_wrapper_step(
+    key, state: EnvWrapperState, actions, env, env_params, rest_n, warm_n
+):
     batch_size = state.obs.shape[0]
 
     new_rest = state.rest + state.is_end.astype(jnp.int32)
@@ -353,21 +391,31 @@ def env_wrapper_step(key, state: EnvWrapperState, actions, env, env_params, rest
         return jax.lax.cond(
             do_reset,
             lambda _: env.reset(key, env_params),  # if True: perform reset
-            lambda _: (obs, env_state),             # if False: return current values
-            operand=None
+            lambda _: (obs, env_state),  # if False: return current values
+            operand=None,
         )
+
     v_maybe_reset = jax.vmap(maybe_reset, in_axes=(0, 0, 0, 0))
     keys_reset = jrandom.split(key, batch_size)
-    new_obs, new_env_state = v_maybe_reset(reset_mask, keys_reset, state.obs, state.env_state)
+    new_obs, new_env_state = v_maybe_reset(
+        reset_mask, keys_reset, state.obs, state.env_state
+    )
     live_mask = jnp.logical_and(new_warm > warm_n, jnp.logical_not(state.is_end))
 
     def maybe_step(live, key, env_state, action, obs):
         return jax.lax.cond(
             live,
             lambda _: env.step(key, env_state, action, env_params),
-            lambda _: (obs, env_state, 0.0, jnp.array(False), {'discount': jnp.array(1.0)}),
-            operand=None
+            lambda _: (
+                obs,
+                env_state,
+                0.0,
+                jnp.array(False),
+                {"discount": jnp.array(1.0)},
+            ),
+            operand=None,
         )
+
     v_maybe_step = jax.vmap(maybe_step, in_axes=(0, 0, 0, 0, 0))
     keys_step = jrandom.split(key, batch_size)
     step_out = v_maybe_step(live_mask, keys_step, new_env_state, actions, new_obs)
@@ -389,13 +437,26 @@ def env_wrapper_step(key, state: EnvWrapperState, actions, env, env_params, rest
         truncated_end=truncated_end,
         rest=new_rest,
         warm=new_warm,
-        state_code=state_code
+        state_code=state_code,
     )
 
-    info = {'state_code': state_code, 'truncated_end': truncated_end}
+    info = {"state_code": state_code, "truncated_end": truncated_end}
     return new_state, (next_obs, rewards, dones, info)
 
-def plot(curves, names, mv_n=100, end_n=1000, xlabel="Episodes", ylabel="Running Average Return", ylim=None, loc=4, save=True, save_dir="./result/plots/", filename="plot.png"):  
+
+def plot(
+    curves,
+    names,
+    mv_n=100,
+    end_n=1000,
+    xlabel="Episodes",
+    ylabel="Running Average Return",
+    ylim=None,
+    loc=4,
+    save=True,
+    save_dir="./result/plots/",
+    filename="plot.png",
+):
     """
     Plots the running average return for each curve and saves the plot as an image.
 
@@ -412,30 +473,58 @@ def plot(curves, names, mv_n=100, end_n=1000, xlabel="Episodes", ylabel="Running
     - save_dir (str): Directory where the plot image will be saved.
     - filename (str): Name of the plot image file.
     """
-    plt.figure(figsize=(10, 7), dpi=150) 
-    colors = ['red', 'blue', 'green', 'crimson','orange', 'purple', 'cyan', 'magenta', 'yellow', 'black']
-    
-    for i, m in enumerate(names.keys()):    
+    plt.figure(figsize=(10, 7), dpi=150)
+    colors = [
+        "red",
+        "blue",
+        "green",
+        "crimson",
+        "orange",
+        "purple",
+        "cyan",
+        "magenta",
+        "yellow",
+        "black",
+    ]
+
+    for i, m in enumerate(names.keys()):
         # Apply moving average
         v = np.array([mv(ep[:end_n], mv_n) for ep in curves[m][0]])
         v = np.mean(v, axis=0)
         r_std = np.std(v, axis=0) / np.sqrt(len(curves[m][0]))
-        v = np.concatenate([np.full([mv_n-1,], np.nan), v])
-        
+        v = np.concatenate(
+            [
+                np.full(
+                    [
+                        mv_n - 1,
+                    ],
+                    np.nan,
+                ),
+                v,
+            ]
+        )
+
         k = names[m]
-        ax = plt.gca()         
+        ax = plt.gca()
         ax.plot(np.arange(len(v)), v, label=k, color=colors[i % len(colors)])
-        ax.fill_between(np.arange(len(v)), v - r_std, v + r_std, label=None, alpha=0.2, color=colors[i % len(colors)])
-    
+        ax.fill_between(
+            np.arange(len(v)),
+            v - r_std,
+            v + r_std,
+            label=None,
+            alpha=0.2,
+            color=colors[i % len(colors)],
+        )
+
     plt.xlabel(xlabel, fontsize=14)
-    plt.ylabel(ylabel, fontsize=14)      
-    if ylim is not None: 
+    plt.ylabel(ylabel, fontsize=14)
+    if ylim is not None:
         plt.ylim(ylim)
     plt.legend(loc=loc, fontsize=12)
     # plt.title(save_dir[-4:])
     plt.title("third layer var")
     plt.tight_layout()
-    
+
     if save:
         os.makedirs(save_dir, exist_ok=True)
         save_path = os.path.join(save_dir, filename)
@@ -443,17 +532,18 @@ def plot(curves, names, mv_n=100, end_n=1000, xlabel="Episodes", ylabel="Running
         print(f"Plot saved to {save_path}")
     else:
         plt.show()
-    
+
     plt.close()
+
 
 # Print the statistic of episode return
 
+
 def print_stat(curves, names):
-  for m in names.keys():
-    print("Stat. on %s:" %m)
-    r = np.average(np.array(curves[m][0]), axis=1)
-    print("Return: avg. %.2f median %.2f min %.2f max %.2f std %.2f" % (np.average(r),
-                                                                        np.median(r),
-                                                                        np.amin(r),
-                                                                        np.amax(r),
-                                                                        np.std(r)))#/np.sqrt(len(r)))) 
+    for m in names.keys():
+        print("Stat. on %s:" % m)
+        r = np.average(np.array(curves[m][0]), axis=1)
+        print(
+            "Return: avg. %.2f median %.2f min %.2f max %.2f std %.2f"
+            % (np.average(r), np.median(r), np.amin(r), np.amax(r), np.std(r))
+        )  # /np.sqrt(len(r))))
