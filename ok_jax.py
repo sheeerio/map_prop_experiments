@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+from abc import ABC, abstractmethod
 import argparse
 import configparser
 import os
@@ -6,299 +7,512 @@ import sys
 import json
 import random
 import numpy as np
+# import gymnax
 import matplotlib.pyplot as plt
+from functools import partial
 import jax
 import jax.numpy as jnp
 from jax import tree_util
-from typing import NamedTuple, List, Tuple
+from jax import jit
 
-# ---------------------- Global RNG ----------------------
-GLOBAL_KEY = jax.random.PRNGKey(0)
+key = jax.random.PRNGKey(0)
 
+def simple_grad_update(params, grads, lr):
+    return tree_util.tree_map(lambda p, g: p + lr * g, params, grads)
 
-def split_key(key):
-    return jax.random.split(key)
+def adam_update(params, grads, opt_state, lr, beta1=0.9, beta2=0.999, epsilon=1e-09):
+    t = opt_state['t'] + 1
+    new_m = tree_util.tree_map(lambda m, g: beta1 * m + (1 - beta1) * g, opt_state['m'], grads)
+    new_v = tree_util.tree_map(lambda v, g: beta2 * v + (1 - beta2) * jnp.square(g), opt_state['v'], grads)
+    m_hat = tree_util.tree_map(lambda m: m / (1 - beta1 ** t), new_m)
+    v_hat = tree_util.tree_map(lambda v: v / (1 - beta2 ** t), new_v)
+    new_params = tree_util.tree_map(lambda p, m, v: p + lr * m / (jnp.sqrt(v) + epsilon),
+                                      params, m_hat, v_hat)
+    new_state = {'m': new_m, 'v': new_v, 't': t}
+    return new_params, new_state
 
-
-# ---------------------- Optimizer -----------------------
-class AdamState(NamedTuple):
-    m: any
-    v: any
-    t: int
-
-
-class AdamParams(NamedTuple):
-    lr: float
-    beta1: float
-    beta2: float
-    eps: float
-
-
-def adam_init(params):
-    # params is pytree of arrays
-    m = tree_util.tree_map(lambda x: jnp.zeros_like(x), params)
-    v = tree_util.tree_map(lambda x: jnp.zeros_like(x), params)
-    return AdamState(m=m, v=v, t=0)
-
+simple_grad_update_jit = jax.jit(simple_grad_update)
+adam_update_jit = jax.jit(adam_update)
 
 @jax.jit
-def adam_update(params, grads, state: AdamState, meta: AdamParams):
-    t = state.t + 1
-    m = tree_util.tree_map(
-        lambda m, g: meta.beta1 * m + (1 - meta.beta1) * g, state.m, grads
-    )
-    v = tree_util.tree_map(
-        lambda v, g: meta.beta2 * v + (1 - meta.beta2) * (g**2), state.v, grads
-    )
-    m_hat = tree_util.tree_map(lambda m_: m_ / (1 - meta.beta1**t), m)
-    v_hat = tree_util.tree_map(lambda v_: v_ / (1 - meta.beta2**t), v)
-    new_params = tree_util.tree_map(
-        lambda p, m_h, v_h: p + meta.lr * m_h / (jnp.sqrt(v_h) + meta.eps),
-        params,
-        m_hat,
-        v_hat,
-    )
-    return new_params, AdamState(m=m, v=v, t=t)
-
-
-# -------------------- Activations ----------------------
 def relu(x):
     return jnp.maximum(x, 0)
 
-
+@jax.jit
 def relu_d(x):
-    return jnp.where(x > 0, 1, 0)
+    return jnp.where(x < 0, 0, 1)
 
-
+@jax.jit
 def sigmoid(x):
-    return 1 / (1 + jnp.exp(-jnp.clip(x, -20, 20)))
+    lim = 20.0
+    return jnp.where(x <= -lim, 0.0,
+                     jnp.where(x >= lim, 1.0,
+                               1.0 / (1.0 + jnp.exp(-x))))
 
-
+@jax.jit
 def sigmoid_d(x):
     s = sigmoid(x)
     return s * (1 - s)
 
-
+@jax.jit
 def softplus(x):
-    return jnp.log1p(jnp.exp(jnp.clip(x, -30, 30)))
+    return jnp.where(x > 30, x, jnp.log1p(jnp.exp(x)))
 
+def softmax(X, theta=1.0, axis=None):
+    y = jnp.atleast_2d(X)
+    if axis is None:
+        for i, dim in enumerate(y.shape):
+            if dim > 1:
+                axis = i
+                break
+    y = y * theta
+    max_val = jnp.max(y, axis=axis, keepdims=True)
+    y = y - max_val
+    y = jnp.where(y < -30, -30, y)
+    y = jnp.exp(y)
+    ax_sum = jnp.sum(y, axis=axis, keepdims=True)
+    p = y / ax_sum
+    if len(X.shape) == 1:
+        p = p.flatten()
+    return p
 
-def softmax(x, temp=1.0):
-    z = x / temp - jnp.max(x / temp, axis=-1, keepdims=True)
-    e = jnp.exp(jnp.clip(z, -30, 30))
-    return e / jnp.sum(e, axis=-1, keepdims=True)
-
-
-# ----------------------- Layer --------------------------
-class LayerParams(NamedTuple):
-    w: jnp.ndarray
-    b: jnp.ndarray
-    inv_var: jnp.ndarray
-
-
-class LayerOptState(NamedTuple):
-    w_adam: AdamState
-    b_adam: AdamState
-
-
-class LayerState(NamedTuple):
-    values: jnp.ndarray
-    new_values: jnp.ndarray
-    w_trace: jnp.ndarray
-    b_trace: jnp.ndarray
-
-
-class LayerMeta(NamedTuple):
-    l_type: int
-    temp: float
-    params: LayerParams
-    opt: LayerOptState
-    state: LayerState
-
-
-LS_REAL = {0, 1, 2, 3}  # softplus, relu, linear, sigmoid
-
-
-def init_layer(rng, in_dim, out_dim, var, temp, l_type, lr):
-    rng, key = split_key(rng)
-    lim = jnp.sqrt(2 / (in_dim + out_dim))
-    w = jax.random.uniform(key, (in_dim, out_dim), -lim, lim)
-    b = jnp.zeros((out_dim,))
-    inv_var = jnp.full((out_dim,), 1 / var)
-    params = LayerParams(w=w, b=b, inv_var=inv_var)
-    w_adam = adam_init(params.w)
-    b_adam = adam_init(params.b)
-    opt = LayerOptState(w_adam=w_adam, b_adam=b_adam)
-    zero = jnp.zeros((1, out_dim))
-    trace_w = jnp.zeros((1, in_dim, out_dim))
-    trace_b = jnp.zeros((1, out_dim))
-    state = LayerState(values=zero, new_values=zero, w_trace=trace_w, b_trace=trace_b)
-    meta = LayerMeta(l_type=l_type, temp=temp, params=params, opt=opt, state=state)
-    return rng, meta
-
-
-def compute_pot_mean(
-    params: LayerParams, inputs: jnp.ndarray, l_type: int, temp: float
-):
-    pot = inputs @ params.w + params.b
-    if l_type in LS_REAL:
-        mean = [softplus, relu, lambda x: x, sigmoid][l_type](pot)
-    else:
-        mean = softmax(pot, temp)
-    return pot, mean
-
+def multinomial_rvs(key, n, p):
+    count = jnp.full(p.shape[:-1], n)
+    out = jnp.zeros(p.shape, dtype=jnp.int32)
+    ps = jnp.cumsum(p, axis=-1)
+    condp = jnp.where(ps == 0, 0.0, p / ps)
+    for i in range(p.shape[-1] - 1, 0, -1):
+        key, subkey = jax.random.split(key)
+        binsample = jax.random.binomial(subkey, n=count, p=condp[..., i]).astype(jnp.int32)
+        out = out.at[..., i].set(binsample)
+        count = count - binsample
+    out = out.at[..., 0].set(count)
+    return key, out
 
 @jax.jit
-def layer_sample(
-    rng, meta: LayerMeta, inputs: jnp.ndarray
-) -> Tuple[jnp.ndarray, LayerMeta, jax.random.KeyArray]:
-    pot, mean = compute_pot_mean(meta.params, inputs, meta.l_type, meta.temp)
-    if meta.l_type in LS_REAL:
-        sigma = jnp.sqrt(1 / meta.params.inv_var)
-        rng, key = split_key(rng)
-        vals = mean + sigma * jax.random.normal(key, pot.shape)
-    else:
-        rng, key = split_key(rng)
-        vals = jax.random.categorical(key, jnp.log(mean), axis=-1)
-    meta = meta._replace(state=meta.state._replace(values=vals, new_values=vals))
-    return vals, meta, rng
-
+def from_one_hot(y):
+    return jnp.argmax(y, axis=-1)
 
 @jax.jit
-def layer_map_ascent(
-    meta: LayerMeta,
-    inputs: jnp.ndarray,
-    next_pot_mean_inv: Tuple[jnp.ndarray, jnp.ndarray],
-    update_size: float,
-) -> LayerMeta:
-    # unpack
-    l_type, temp, params, opt_state, state = meta
-    pot, mean = compute_pot_mean(params, inputs, l_type, temp)
-    # compute new_values
-    if next_pot_mean_inv is None:
-        # output layer
-        if l_type in LS_REAL:
-            sigma = jnp.sqrt(1 / params.inv_var)
-            vals = mean + sigma * jax.random.normal(GLOBAL_KEY, pot.shape)
-        else:
-            vals = jax.random.categorical(GLOBAL_KEY, jnp.log(mean), axis=-1)
-    else:
-        next_pot, next_mean, next_inv_var, next_ltype = next_pot_mean_inv
-        lower = (mean - state.values) * params.inv_var
-        if next_ltype in LS_REAL:
-            upper = (
-                (state.new_values - next_mean)
-                * [relu_d, softplus, lambda x: 1, sigmoid_d][next_ltype](next_pot)
-                * next_inv_var
-            ) @ params.w.T
-        else:
-            upper = ((state.new_values - next_mean) / temp) @ params.w.T
-        vals = state.values + update_size * (lower + upper)
-    new_state = state._replace(new_values=vals)
-    return meta._replace(state=new_state)
+def to_one_hot(a, size):
+    return jnp.eye(size, dtype=jnp.int32)[a.astype(jnp.int32)]
 
-
-# ---------------------- Network ------------------------
-class NetParams(NamedTuple):
-    layers: List[LayerMeta]
-
+def getl(x, n):
+    return x[n] if isinstance(x, list) else x
 
 @jax.jit
-def net_forward(params: NetParams, state, inputs):
-    rng = state["rng"]
-    metas = state["metas"]
-    h = inputs
-    new_metas = []
-    for meta in metas:
-        h, meta, rng = layer_sample(rng, meta, h)
-        new_metas.append(meta)
-    new_state = {"rng": rng, "metas": new_metas}
-    return new_state, h
-
+def equal_zero(x):
+    return jnp.logical_and(x > -1e-8, x < 1e-8).astype(jnp.float32)
 
 @jax.jit
-def net_map_ascent(params: NetParams, state, inputs, update_sizes: List[float]):
-    # one step across all layers
-    metas = state["metas"]
-    pots_means = []
-    # first compute pot/mean for all
-    h = inputs
-    for meta in metas:
-        pot, mean = compute_pot_mean(meta.params, h, meta.l_type, meta.temp)
-        pots_means.append((pot, mean, meta.params.inv_var, meta.l_type))
-        h = meta.state.new_values
-    # update each layer
-    new_metas = []
-    for i, meta in enumerate(metas):
-        next_info = pots_means[i + 1] if i + 1 < len(metas) else None
-        meta = layer_map_ascent(
-            meta,
-            pots_means[i][1].shape and inputs
-            if i == 0
-            else metas[i - 1].state.new_values,
-            next_info,
-            update_sizes[i],
-        )
-        new_metas.append(meta)
-    new_state = {"rng": state["rng"], "metas": new_metas}
-    return new_state
-
-
-import argparse, configparser, os, sys, json, random
-import numpy as np
-import jax, jax.numpy as jnp
-from jax import value_and_grad
-
-# Assume all functions and classes (AdamParams, init_layer, NetParams, net_forward, net_map_ascent, etc.)
-# are imported or defined above.
-
-
-def pure_complex_multiplexer(batch_size, addr_size=5, action_size=1):
-    # generate random inputs and compute true y, returns x, y
-    key = jax.random.PRNGKey(random.randint(0, 2**31 - 1))
-    x = jax.random.bernoulli(
-        key, 0.5, (batch_size, addr_size * action_size + 2**addr_size)
-    ).astype(jnp.int32)
-    # compute y as before
-    x_reshaped = x[:, : addr_size * action_size].reshape(
-        batch_size, action_size, addr_size
-    )
-    weights = 2 ** (addr_size - 1 - jnp.arange(addr_size))
-    addr = jnp.sum(x_reshaped * weights, axis=2)
-    indices = addr_size * action_size + addr
-    y = x[jnp.arange(batch_size), indices[:, 0]]
-    return x, y
-
-
-def pure_mnist_batch(batch_size, dataset, ptr, epoch_idx):
-    # dataset: (X, y) arrays
-    X, y = dataset
-    if ptr + batch_size > X.shape[0]:
-        epoch_idx = (epoch_idx + 1) % X.shape[0]
-        ptr = 0
-    batch_x = X[ptr : ptr + batch_size]
-    batch_y = y[ptr : ptr + batch_size]
-    return batch_x, batch_y, ptr + batch_size, epoch_idx
-
+def mask_neg(x):
+    return (x < 0).astype(jnp.float32)
 
 @jax.jit
-def from_one_hot(p):
-    return jnp.argmax(p, axis=-1)
+def sign(x):
+    return (x > 1e-8).astype(jnp.float32) - (x < -1e-8).astype(jnp.float32)
 
-
+@jax.jit
 def zero_to_neg(x):
     return (x > 1e-8).astype(jnp.float32) - (x <= 1e-8).astype(jnp.float32)
 
+@jax.jit
+def neg_to_zero(x):
+    return (x > 1e-8).astype(jnp.float32)
 
-# main integrating pure net_forward and net_map_ascent
+def apply_mask(x, mask):
+    return (x.T * mask).T
+
+@jax.jit
+def linear_interpolat(start, end, end_t, cur_t):
+    if isinstance(start, list):
+        if isinstance(end_t, list):
+            return [(e - s) * jnp.minimum(cur_t, d) / d + s for (s, e, d) in zip(start, end, end_t)]
+        else:
+            return [(e - s) * jnp.minimum(cur_t, end_t) / end_t + s for s, e in zip(start, end)]
+    else:
+        if isinstance(end_t, list):
+            return [(end - start) * jnp.minimum(cur_t, d) / d + start for d in end_t]
+        else:
+            return (end - start) * jnp.minimum(cur_t, end_t) / end_t
+
+class simple_grad_optimizer():
+    def __init__(self, learning_rate):
+        self.learning_rate = learning_rate
+
+    def delta(self, name, grads, learning_rate=None):
+        lr = self.learning_rate if learning_rate is None else learning_rate
+        return [lr * g for g in grads]
+
+class adam_optimizer():
+    def __init__(self, learning_rate, beta_1=0.9, beta_2=0.999, epsilon=1e-09):
+        self.beta_1 = beta_1
+        self.beta_2 = beta_2
+        self.epsilon = epsilon
+        self.learning_rate = learning_rate
+        self._cache = {}
+
+    def delta(self, grads, name="w", learning_rate=None, gate=None):
+        if name not in self._cache:
+            self._cache[name] = [[jnp.zeros_like(g) for g in grads],
+                                 [jnp.zeros_like(g) for g in grads],
+                                 0]
+        self._cache[name][2] += 1
+        t = self._cache[name][2]
+        deltas = []
+        lr = self.learning_rate if learning_rate is None else learning_rate
+        for n, g in enumerate(grads):
+            m = self._cache[name][0][n]
+            v = self._cache[name][1][n]
+            m = self.beta_1 * m + (1 - self.beta_1) * g
+            v = self.beta_2 * v + (1 - self.beta_2) * jnp.power(g, 2)
+            self._cache[name][0][n] = m
+            self._cache[name][1][n] = v
+            m_hat = m / (1 - jnp.power(self.beta_1, t))
+            v_hat = v / (1 - jnp.power(self.beta_2, t))
+            deltas.append(lr * m_hat / (jnp.sqrt(v_hat) + self.epsilon))
+        return deltas
+
+class MDP(ABC):
+    def __init__(self):
+        super().__init__()
+        self.rng = jax.random.PRNGKey(random.randint(0, 2**31 - 1))
+
+    @abstractmethod
+    def reset(self, batch_size):
+        pass
+
+    @abstractmethod
+    def act(self, actions):
+        pass
+
+class complex_multiplexer_MDP(MDP):
+    def __init__(self, addr_size=2, action_size=2, zero=True, reward_zero=True):
+        self.addr_size = addr_size
+        self.action_size = action_size
+        self.x_size = addr_size * action_size + 2 ** addr_size
+        self.zero = zero
+        self.reward_zero = reward_zero
+        super().__init__()
+
+    def reset(self, batch_size):
+        addr_size = self.addr_size
+        action_size = self.action_size
+        x_size = self.x_size
+        self.rng, subkey = jax.random.split(self.rng)
+        self.x = jax.random.bernoulli(subkey, p=0.5, shape=(batch_size, x_size)).astype(jnp.int32)
+        x_reshaped = self.x[:, :addr_size * action_size].reshape((batch_size, action_size, addr_size))
+        weights = 2 ** (addr_size - 1 - jnp.arange(addr_size))
+        addr = jnp.sum(x_reshaped * weights, axis=2)
+        indices = ((addr_size * action_size + addr).astype(jnp.int32))[:, None]
+        rows = jnp.arange(self.x.shape[0])[:, None]  # shape (batch_size, 1)
+        cols = addr_size * action_size + addr         # shape (batch_size, action_size)
+        self.y = self.x[rows, cols]
+        if not self.zero:
+            self.y = zero_to_neg(self.y)
+        return self.x if self.zero else zero_to_neg(self.x)
+
+    def act(self, actions):
+        return act_complex_multiplexer(self.y, actions, self.reward_zero)
+
+    def expected_reward(self, p):
+        reward_f = jnp.full((self.x.shape[0], 2), 0.0 if self.reward_zero else -1.0)
+        y_zero = self.y if self.zero else neg_to_zero(self.y)
+        reward_f = reward_f.at[jnp.arange(self.x.shape[0]), y_zero.astype(jnp.int32)].set(1)
+        return jnp.sum(reward_f * p, axis=-1)
+
+class MNIST_MDP(MDP):
+    def __init__(self, train=True, gamma=1.0):
+        import tensorflow_datasets as tfds
+        import tensorflow as tf
+        # Load the dataset via tfds (using the 'as_supervised' flag)
+        split = 'train[:10000]' if train else 'test'
+        ds = tfds.load('mnist', split=split, as_supervised=True)
+        # Normalize images and cast them to float32
+        ds = ds.map(lambda img, label: (tf.cast(img, tf.float32) / 255.0, label))
+        # Batch the entire dataset to load it into memory (MNIST is small)
+        ds = ds.batch(10000)
+        for img, label in ds.take(1):
+            X = img.numpy()
+            y = label.numpy()
+        # Flatten images: 28x28 -> 784
+        X = X.reshape(-1, 28 * 28)
+        self.X = jnp.array(X)
+        self.y = jnp.array(y)
+        self.dataset_size = self.X.shape[0]
+        self.x_size = 28 * 28
+        self.n_classes = 10
+        self.gamma = gamma
+        self.rng = jax.random.PRNGKey(random.randint(0, 2**31 - 1))
+        
+        # **NEW**: Initialize epoch ordering and pointer for sequential batching.
+        self.epoch_indices = np.arange(self.dataset_size)
+        np.random.shuffle(self.epoch_indices)  # Shuffle for the first epoch.
+        self.current_index = 0
+
+    def reset(self, batch_size):
+        # **NEW**: Instead of randomly sampling indices, use sequential batches.
+        if self.current_index + batch_size > self.dataset_size:
+            # End of epoch reached, reshuffle indices and reset pointer.
+            np.random.shuffle(self.epoch_indices)
+            self.current_index = 0
+        indices = self.epoch_indices[self.current_index:self.current_index + batch_size]
+        self.current_index += batch_size
+        self.current_X = self.X[indices]
+        self.current_y = self.y[indices]
+        return self.current_X
+
+    def act(self, actions):
+        if actions.ndim > 1 and actions.shape[1] > 1:
+            pred = jnp.argmax(actions, axis=1)
+        else:
+            pred = actions.flatten()
+        raw_reward = jnp.where(pred == self.current_y, 1.0, 0.0)
+        baseline = jnp.mean(raw_reward)
+        advantage = raw_reward - baseline
+        return raw_reward.reshape(-1,1)
+        return advantage.reshape(-1, 1)
+
+@jax.jit
+def act_complex_multiplexer(y, actions, reward_zero):
+    corr = (y == actions.astype(jnp.int32)).astype(jnp.float32)
+    return jnp.where(reward_zero, corr, (corr > 0).astype(jnp.float32) - (corr <= 0).astype(jnp.float32))
+
+def mv(a, n=1000):
+    ret = jnp.cumsum(a, dtype=jnp.float32)
+    ret = ret.at[n:].set(ret[n:] - ret[:-n])
+    return ret[n - 1:] / n
+
+def plot(curves, names, mv_n=100, end_n=1000, xlabel="Episodes", ylabel="Running Average Return",
+         ylim=None, loc=4, save=True, save_dir="./result/plots/", filename="plot.png"):
+    plt.figure(figsize=(10, 7), dpi=150)
+    colors = ['red', 'blue', 'green', 'crimson', 'orange', 'purple', 'cyan', 'magenta', 'yellow', 'black']
+
+    for i, m in enumerate(names.keys()):
+        v = jnp.array([mv(ep[:end_n], mv_n) for ep in curves[m][0]])
+        v_mean = jnp.mean(v, axis=0)
+        r_std = jnp.std(v, axis=0) / jnp.sqrt(len(curves[m][0]))
+        v_full = jnp.concatenate([jnp.full((mv_n - 1,), jnp.nan), v_mean])
+        ax = plt.gca()
+        ax.plot(np.arange(len(v_full)), np.array(v_full), label=names[m], color=colors[i % len(colors)])
+        ax.fill_between(np.arange(len(v_full)),
+                        np.array(v_full - r_std),
+                        np.array(v_full + r_std),
+                        alpha=0.2, color=colors[i % len(colors)])
+    plt.xlabel(xlabel, fontsize=14)
+    plt.ylabel(ylabel, fontsize=14)
+    if ylim is not None:
+        plt.ylim(ylim)
+    plt.legend(loc=loc, fontsize=12)
+    plt.title("third layer var")
+    plt.tight_layout()
+    if save:
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, filename)
+        plt.savefig(save_path)
+        print(f"Plot saved to {save_path}")
+    else:
+        plt.show()
+    plt.close()
+
+def print_stat(curves, names):
+    for m in names.keys():
+        print("Stat. on %s:" % m)
+        r = np.average(np.array(curves[m][0]), axis=1)
+        print("Return: avg. %.2f median %.2f min %.2f max %.2f std %.2f" %
+              (np.average(r), np.median(r), np.amin(r), np.amax(r), np.std(r)))
+
+L_SOFTPLUS = 0
+L_RELU = 1
+L_LINEAR = 2
+L_SIGMOID = 3
+L_DISCRETE = 4
+LS_REAL = [L_SOFTPLUS, L_RELU, L_LINEAR, L_SIGMOID]
+
+ACT_F = {L_SOFTPLUS: softplus,
+         L_RELU: relu,
+         L_SIGMOID: sigmoid,
+         L_LINEAR: lambda x: x}
+
+ACT_D_F = {L_SOFTPLUS: sigmoid,
+           L_RELU: relu_d,
+           L_SIGMOID: sigmoid_d,
+           L_LINEAR: lambda x: 1}
+
+class eq_prop_layer():
+    def __init__(self, name, input_size, output_size, optimizer, var, temp, l_type):
+        if l_type not in [L_SOFTPLUS, L_RELU, L_LINEAR, L_SIGMOID, L_DISCRETE]:
+            raise Exception('l_type (%d) not implemented' % l_type)
+        self.name = name
+        self.input_size = input_size
+        self.output_size = output_size
+        self.optimizer = optimizer
+        self.l_type = l_type
+        self.temp = temp if l_type == L_DISCRETE else 1
+
+        lim = jnp.sqrt(2 / (input_size + output_size))
+        self.rng = jax.random.PRNGKey(random.randint(0, 2**31 - 1))
+        self.rng, subkey = jax.random.split(self.rng)
+        self._w = jax.random.uniform(subkey, shape=(input_size, output_size), minval=-lim, maxval=lim)
+        self._b = jnp.zeros((output_size,))
+        self._inv_var = jnp.full((output_size,), 1/var)
+        
+        # Initialize optimizer states for weights and biases:
+        self.opt_state_w = {'m': jnp.zeros_like(self._w), 'v': jnp.zeros_like(self._w), 't': 0}
+        self.opt_state_b = {'m': jnp.zeros_like(self._b), 'v': jnp.zeros_like(self._b), 't': 0}
+        
+
+
+        self.prev_layer = None
+        self.next_layer = None
+        self.values = jnp.zeros((1, output_size))
+        self.new_values = jnp.zeros((1, output_size))
+        self.w_trace = jnp.zeros((1, input_size, output_size))
+        self.b_trace = jnp.zeros((1, output_size))
+
+    def compute_pot_mean(self, inputs):
+        self.inputs = inputs
+        self.pot = jnp.dot(inputs, self._w) + self._b
+        if self.l_type in LS_REAL:
+            self.mean = ACT_F[self.l_type](self.pot)
+        else:
+            self.mean = softmax(self.pot / self.temp, axis=-1)
+
+    def sample(self, inputs):
+        self.compute_pot_mean(inputs)
+        if self.l_type in LS_REAL:
+            sigma = jnp.sqrt(1 / self._inv_var)
+            self.rng, subkey = jax.random.split(self.rng)
+            self.values = self.mean + sigma * jax.random.normal(subkey, shape=self.pot.shape)
+            return self.values
+        elif self.l_type == L_DISCRETE:
+            if self.next_layer is None:
+                self.values = self.mean
+                return self.values
+            self.rng, subkey = jax.random.split(self.rng)
+            self.rng, sampled = multinomial_rvs(subkey, 1, self.mean)
+            self.values = sampled
+            return self.values
+
+    def refresh(self, freeze_value):
+        if self.prev_layer is not None:
+            self.inputs = self.prev_layer.new_values
+        self.compute_pot_mean(self.inputs)
+        if not freeze_value:
+            self.values = self.new_values
+
+    def update(self, update_size):
+        # output layer
+        if self.next_layer is None:
+            if self.l_type in LS_REAL:
+                sigma = jnp.sqrt(1 / self._inv_var)
+                self.rng, subkey = jax.random.split(self.rng)
+                self.new_values = self.mean + sigma * jax.random.normal(subkey, shape=self.pot.shape)
+            elif self.l_type == L_DISCRETE:
+                self.rng, subkey = jax.random.split(self.rng)
+                self.rng, sampled = multinomial_rvs(subkey, 1, self.mean)
+                self.new_values = sampled
+        # layers except output layer
+        elif self.l_type in LS_REAL:
+            lower_pot = (self.mean - self.values) * self._inv_var
+            if self.next_layer is None:
+                upper_pot = 0.
+            else:
+                fb_w = self.next_layer._w.T
+                if self.next_layer.l_type in LS_REAL:
+                    upper_pot = jnp.dot((self.next_layer.values - self.next_layer.mean) *
+                                          ACT_D_F[self.next_layer.l_type](self.next_layer.pot) *
+                                          self.next_layer._inv_var,
+                                          fb_w)
+                else:
+                    upper_pot = jnp.dot((self.next_layer.values - self.next_layer.mean), fb_w) / self.next_layer.temp
+            update_pot = lower_pot + upper_pot
+            update_step = update_size * update_pot
+            self.new_values = self.values + update_step
+
+    def record_trace(self, gate=None, lambda_=0):
+        if self.l_type in LS_REAL:
+            v_ch = (self.values - self.mean) * ACT_D_F[self.l_type](self.pot) * self._inv_var
+        else:
+            v_ch = (self.values - self.mean) / self.temp
+        if gate is not None:
+            v_ch = v_ch * gate[:, None]
+        self.w_trace = self.w_trace * lambda_ + self.inputs[:, :, None] * v_ch[:, None, :]
+        self.b_trace = self.b_trace * lambda_ + v_ch
+
+    def learn_trace(self, reward, lr=0.01):
+        w_update = self.w_trace * reward[:, None, None]
+        b_update = self.b_trace * reward[:, None]
+        w_update = jnp.mean(w_update, axis=0)
+        b_update = jnp.mean(b_update, axis=0)
+
+        self._w, self.opt_state_w = adam_update_jit(self._w, w_update, self.opt_state_w, lr)
+        self._b, self.opt_state_b = adam_update_jit(self._b, b_update, self.opt_state_b, lr)
+
+    def clear_trace(self, mask):
+        mask = mask.astype(jnp.float32)
+        self.w_trace = self.w_trace * mask[:, None, None]
+        self.b_trace = self.b_trace * mask[:, None]
+
+    def clear_values(self, mask):
+        self.values = self.values * mask[:, None]
+        self.new_values = self.new_values * mask[:, None]
+
+class Network():
+    def __init__(self, state_n, action_n, hidden, var, temp, hidden_l_type, output_l_type):
+        self.layers = []
+        in_size = state_n
+        optimizer = adam_optimizer(learning_rate=0.01, beta_1=0.9, beta_2=0.999)
+        self.rng = jax.random.PRNGKey(random.randint(0, 2**31 - 1))
+        for d, n in enumerate(hidden + [action_n]):
+            l_type = output_l_type if d == len(hidden) else hidden_l_type
+            a = eq_prop_layer(name="layer_%d" % d, input_size=in_size, output_size=n,
+                              optimizer=optimizer, var=getl(var, d), temp=temp, l_type=l_type)
+            self.rng, layer_key = jax.random.split(self.rng)
+            a.rng = layer_key
+            if d > 0:
+                a.prev_layer = self.layers[-1]
+                self.layers[-1].next_layer = a
+            self.layers.append(a)
+            in_size = n
+
+    def forward(self, state):
+        self.state = state
+        h = state
+        for a in self.layers:
+            h = a.sample(h)
+        self.action = h
+        return self.action
+
+    def map_grad_ascent(self, steps, state=None, gate=False, lambda_=0, update_size=0.01):
+        for i in range(steps):
+            for n, a in enumerate(self.layers if state is not None else self.layers[:-1]):
+                a.update(getl(update_size, n))
+            for n, a in enumerate(self.layers):
+                a.refresh(freeze_value=(n == (len(self.layers) - 1) and state is None))
+            if i == steps - 1:
+                gate_c = 1 / (self.layers[-1].values - self.layers[-1].mean)[:, 0] if gate else None
+                for a in self.layers:
+                    a.record_trace(gate=gate_c, lambda_=lambda_)
+
+    def learn(self, reward, lr=0.01):
+        for n, a in enumerate(self.layers):
+            a.learn_trace(reward=reward, lr=getl(lr, n))
+
+    def clear_trace(self, mask):
+        for a in self.layers:
+            a.clear_trace(mask)
+
+    def clear_values(self, mask):
+        for a in self.layers:
+            a.clear_values(mask)
+
 def main():
-    # parse config (omitted for brevity, same as user provided)
     initial_parser = argparse.ArgumentParser(add_help=False)
     initial_parser.add_argument(
-        "-c",
-        "--config",
+        "-c", "--config",
         default="config_mn.ini",
-        help="Location of config file (default: config_mp.ini)",
+        help="Location of config file (default: config_mp.ini)"
     )
     args, remaining_argv = initial_parser.parse_known_args()
 
@@ -313,87 +527,92 @@ def main():
 
     parser = argparse.ArgumentParser(
         parents=[initial_parser],
-        description="Script with configurable parameters via config file and command-line flags.",
+        description="Script with configurable parameters via config file and command-line flags."
     )
 
     parser.add_argument(
         "--name",
         default=config.get("DEFAULT", "name"),
-        help="Name identifier for the run.",
+        help="Name identifier for the run."
     )
     parser.add_argument(
-        "--exp_num", type=int, default=1, help="Experiment number to help with tracking"
+        "--exp_num",
+        type=int,
+        default=1,
+        help="Experiment number to help with tracking"
     )
     parser.add_argument(
         "--max_eps",
         type=int,
         default=config.getint("DEFAULT", "max_eps"),
-        help="Number of episodes per run.",
+        help="Number of episodes per run."
     )
     parser.add_argument(
         "--n_run",
         type=int,
         default=config.getint("DEFAULT", "n_run"),
-        help="Number of runs.",
+        help="Number of runs."
     )
 
     parser.add_argument(
         "--env_name",
         default=config.get("DEFAULT", "env_name"),
-        choices=["Multiplexer", "Regression", "MNIST"],
-        help="Environment name (e.g., Multiplexer, Regression).",
+        choices=["Multiplexer", "Regression"],
+        help="Environment name (e.g., Multiplexer, Regression)."
     )
     parser.add_argument(
         "--batch_size",
         type=int,
         default=config.getint("DEFAULT", "batch_size"),
-        help="Batch size.",
+        help="Batch size."
     )
     parser.add_argument(
         "--hidden",
         type=str,
         default=config.get("DEFAULT", "hidden"),
-        help="JSON list of hidden units per layer (e.g., '[64, 32]').",
+        help="JSON list of hidden units per layer (e.g., '[64, 32]')."
     )
     parser.add_argument(
-        "--print_every", type=int, default=config.get("DEFAULT", "print_every")
+      "--print_every",
+      type=int,
+      default=config.get("DEFAULT", "print_every")
     )
     parser.add_argument(
         "--l_type",
         type=int,
         choices=[0, 1, 2, 3, 4],
         default=config.getint("DEFAULT", "l_type"),
-        help="Activation function type: 0=Softplus, 1=ReLU, 2=Linear, 3=Sigmoid, 4=Discrete.",
+        help="Activation function type: 0=Softplus, 1=ReLU, 2=Linear, 3=Sigmoid, 4=Discrete."
     )
     parser.add_argument(
         "--temp",
         type=float,
         default=config.getfloat("DEFAULT", "temp"),
-        help="Temperature for the network if applicable.",
+        help="Temperature for the network if applicable."
     )
     parser.add_argument(
         "--var",
         type=str,
         default=config.get("DEFAULT", "var"),
-        help="JSON list of variances in hidden layers (e.g., '[0.3, 1, 1]').",
+        help="JSON list of variances in hidden layers (e.g., '[0.3, 1, 1]')."
     )
     parser.add_argument(
         "--update_adj",
         type=float,
         default=config.getfloat("DEFAULT", "update_adj"),
-        help="Step size for minimizing the energy of the network equals to the layer's variance multiplied by this constant",
+        help="Step size for energy minimization adjustment."
     )
     parser.add_argument(
         "--map_grad_ascent_steps",
         type=int,
         default=config.getint("DEFAULT", "map_grad_ascent_steps"),
-        help="Number of gradient ascent steps for energy minimization.",
+        help="Number of gradient ascent steps for energy minimization."
     )
     parser.add_argument(
         "--lr",
         type=str,
         default=config.get("DEFAULT", "lr"),
-        help="JSON list of learning rates (e.g., '[0.04, 0.00004, 0.000004]').",
+        help="JSON list of learning rates (e.g., '[0.04, 0.00004, 0.000004]')."
     )
 
     args = parser.parse_args()
@@ -422,67 +641,104 @@ def main():
         print("Error: 'lr' must be a valid JSON list")
         sys.exit(1)
 
-    batch_size = args.batch_size
-    hidden = json.loads(args.hidden)  # e.g. [64, 32]
-    var = json.loads(args.var)  # one variance per hidden layer
-    lr_list = json.loads(args.lr)  # one lr per layer (if you want per‐layer)
-    temp = args.temp
-    l_types = [args.l_type] * len(hidden) + [
-        4
-    ]  # e.g. same hidden type, discrete output
-    update_adj = args.update_adj
+    L_SOFTPLUS = 0
+    L_RELU = 1
+    L_LINEAR = 2
+    L_SIGMOID = 3
+    L_DISCRETE = 4
 
-    # compute per-layer MAP‐Prop step sizes
-    update_sizes = [v * update_adj for v in var] + [update_adj]
-
-    # now initialize the network
-    rng = jax.random.PRNGKey(random.randint(0, 2**31 - 1))
-    layers_meta = []
-    env = pure_complex_multiplexer(batch_size=batch_size)
-    in_dim = env.x_size  # input dimension (state size)
-    for idx, out_dim in enumerate(hidden + [env.action_n]):
-        this_var = var[idx]  # variance for this layer
-        this_ltype = l_types[idx]
-        this_lr = lr_list[idx]  # if you want per-layer learning‐rate in Adam
-        rng, meta = init_layer(
-            rng,
-            in_dim=in_dim,
-            out_dim=out_dim,
-            var=this_var,
-            temp=temp,
-            l_type=this_ltype,
-            lr=this_lr,
+    if args.env_name == "Multiplexer":
+        env = complex_multiplexer_MDP(
+            addr_size=5,
+            action_size=1,
+            zero=False,
+            reward_zero=False
         )
-        layers_meta.append(meta)
-        in_dim = out_dim  # next layer’s input is this layer’s output
+        gate = False
+        output_l_type = L_DISCRETE
+        action_n = 2 ** env.action_size
+    elif args.env_name == "MNIST":
+        env = MNIST_MDP(train=True)
+        gate = False
+        output_l_type = L_DISCRETE
+        action_n = env.n_classes
 
-    # bundle into your NetParams and state
-    net_params = NetParams(layers=layers_meta)
-    net_state = {"rng": rng, "metas": layers_meta}
+    else:
+        print(f"Error: Unsupported environment '{args.env_name}'.")
+        sys.exit(1)
 
-    # create a matching Adam state for the whole network
-    net_opt_state = adam_init(net_params)
+    update_size = [i * args.update_adj for i in var]
+    print_every = args.batch_size * args.print_every
 
-    # training loop skeleton
-    for epoch in range(1):
-        x, y = pure_complex_multiplexer(batch_size)
-        net_state, action_probs = net_forward(net_params, net_state, x)
-        actions = zero_to_neg(from_one_hot(action_probs))[:, None]
-        rewards = (actions.flatten() == y).astype(jnp.float32)
+    eps_ret_hist_full = []
+    net = Network(
+              state_n=env.x_size,
+              action_n=action_n,
+              hidden=hidden,
+              var=var,
+              temp=args.temp,
+              hidden_l_type=args.l_type,
+              output_l_type=output_l_type
+          )
+    for j in range(args.n_run):
+        eps_ret_hist = []
+        print_count = print_every
+        for i in range(args.max_eps // args.batch_size):
+            # print("Bang bang")
+            state = env.reset(args.batch_size)
+            action = net.forward(state)
+            if args.env_name == "Multiplexer":
+                action = zero_to_neg(from_one_hot(action))[:, jnp.newaxis]
+                reward = env.act(action)[:, 0]
+            elif args.env_name == "Regression":
+                action =   action[:, 0]
+                reward = env.act(action)
+            elif args.env_name == "MNIST":
+                # If the network output is one-hot, convert to label indices.
+                action = jnp.argmax(action, axis=1)
+                reward = env.act(action)[:, 0]
 
-        # MAP-Prop
-        net_state = net_map_ascent(net_params, net_state, x, update_sizes)
-        # REINFORCE (sketch)
-        # compute loss, grads, update params
-        loss = -jnp.mean(rewards)
-        grads = jax.grad(lambda p: -jnp.mean(rewards))(net_params)
-        net_params, _ = adam_update(
-            net_params, grads, net_opt_state, AdamParams(lr_meta, 0.9, 0.999, 1e-9)
-        )
+            eps_ret_hist.append(np.average(np.array(reward)))
 
-        # periodic print
-        print(f"Loss: {loss}")
+            # 2. MAP-Prop Update phase
+            net.map_grad_ascent(
+                steps=args.map_grad_ascent_steps,
+                state=None,
+                gate=gate,
+                lambda_=0,
+                update_size=update_size
+            )
+           
+            if args.env_name == "Regression":
+                reward = env.y - net.layers[-1].mean[:, 0]
+            
+            # 3. REINFORCE phase
+            net.learn(reward, lr=lr)
 
+            if (i * args.batch_size) > print_count:
+                running_avg = np.average(eps_ret_hist[-print_every // args.batch_size:])
+                print(f"Run {j} Step {i} Running Avg. Reward\t{running_avg:.6f}")
+                print_count += print_every
+        eps_ret_hist_full.append(eps_ret_hist)
+
+    eps_ret_hist_full = np.asarray(eps_ret_hist_full, dtype=np.float32)
+    print("Finished Training")
+
+    curves = {args.name: (eps_ret_hist_full,)}
+    names = {k: k for k in curves.keys()}
+
+    plots_dir = os.path.join(f"result/exp{args.exp_num}", "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+
+    result_dir = f"result/exp{args.exp_num}"
+    os.makedirs(result_dir, exist_ok=True)
+    result_file = os.path.join(result_dir, f"{args.name}.npy")
+    print(f"Results (saved to {result_file}):")
+    np.save(result_file, curves)
+    print_stat(curves, names)
+
+    # plot_filename = f"{args.name}_plot.png"
+    # plot(curves, names, mv_n=10, end_n=args.max_eps, save=True, save_dir=plots_dir, filename=plot_filename)
 
 if __name__ == "__main__":
     main()
